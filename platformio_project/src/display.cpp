@@ -1,3 +1,4 @@
+#include "morse_state.h"
 #include "display.h"
 #include <Wire.h>
 #include <Adafruit_GFX.h>
@@ -224,3 +225,4 @@ void updateDisplay() {
   lastState = currentState;
   lastModeSwitching = modeSwitching;
 }
+

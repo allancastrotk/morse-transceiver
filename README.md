@@ -1,130 +1,153 @@
 # morse-transceiver
 
-Um transceptor CW (Morse) baseado em ESP8266 que permite enviar/receber sinais Morse localmente (botão + buzzer) e remotamente via Wi‑Fi/TCP entre duas unidades. Fornece feedback visual por LED (pisca mensagens em Morse) e interface por display OLED.
+A CW (Morse) transceiver based on ESP8266 that lets you send/receive Morse signals locally (button + buzzer) and remotely over Wi‑Fi/TCP between two units. Provides visual feedback via an OLED display (SSD1306) and an LED that blinks Morse messages.
 
 ---
 
-## Conteúdo do repositório (descrição breve)
-- `morse-project.ino` — setup e loop principal (orquestra módulos)  
-- `cw-transceiver.cpp` / `.h` — núcleo CW (entrada, buzzer, tradução, histórico)  
-- `network.cpp` / `.h` — gerenciamento Wi‑Fi assíncrono, TCP e protocolo de mensagens  
-- `blinker.cpp` / `.h` — converte texto → Morse e pisca LED  
-- `display.*` — módulo do display OLED (não enviado aqui; define `initDisplay()` e `updateDisplay()`)  
-- `bitmap.h` (opcional) — imagem usada no splash
+## Repository contents (brief)
+- `morse-project.ino` — main setup and loop (orchestrates modules)  
+- `cw-transceiver.cpp` / `.h` — core CW logic (input, buzzer, translation, history)  
+- `network.cpp` / `.h` — asynchronous Wi‑Fi management, TCP and messaging protocol  
+- `blinker.cpp` / `.h` — converts text → Morse and blinks LED  
+- `display.cpp` / `.h` — OLED UI (Adafruit SSD1306)  
+- `bitmap.h` (optional) — image used for the splash screen
 
 ---
 
-## Visão geral funcional
-- Entrada local: botão em D5 (INPUT_PULLUP).  
-- Entrada remota: mensagens `duration:<ms>` recebidas via TCP definem pressões remotas.  
-- Buzzer em D8: liga enquanto há press local/remoto.  
-- Estado da conexão: `FREE`, `TX`, `RX`. Quando um envio local começa e a rede está disponível, a unidade ocupa a rede e envia o duration ao peer.  
-- Protocolo TCP textual simples (porta 5000): `alive`, `duration:<ms>`, `request_tx`, `ok`/`busy`, `mac:<mac>`. Heartbeat a cada 1s.  
-- Blinker (D4) pisca mensagens em Morse continuamente (mensagem padrão `"SEMPRE ALERTA"`).  
-- Operação não bloqueante com `millis()` + `yield()` (ESP8266-friendly).
+## Functional overview
+- Local input: physical key/button on D5 (INPUT_PULLUP).  
+- Remote input: `duration:<ms>` messages received over TCP represent remote key presses.  
+- Buzzer on D8: ON while a local/remote press is active.  
+- Connection states: `FREE`, `TX`, `RX`. When a local transmission starts and the network is available, the unit occupies the network and sends the duration to the peer.  
+- Simple text-based TCP protocol (port 5000): `alive`, `duration:<ms>`, `request_tx`, `ok`/`busy`, `mac:<mac>`. Heartbeat every 1s.  
+- Blinker (D4) continuously flashes Morse messages (default `"SEMPRE ALERTA"`).  
+- Non-blocking design using `millis()` + `yield()` (ESP8266-friendly).
 
 ---
 
-## Esquemático mínimo / mapeamento de pinos
-- D5 — botão LOCAL (INPUT_PULLUP; botão fecha para GND)  
-- D6 — entrada REMOTE (INPUT_PULLUP)  
-- D8 — buzzer (digital ON/OFF) — buzzer passivo pode precisar de driver/transistor  
-- D4 — LED blinker (GPIO2; ativo HIGH)  
-- I2C display — normalmente D1 = SCL, D2 = SDA (ver `display.*` para confirmar endereço/biblioteca)  
-- Alimentação: 5V/USB ou 3.3V conforme placa (usar regulador apropriado)
+## Display details (SSD1306 OLED)
+- Driver: Adafruit_SSD1306 (Adafruit GFX)  
+- Resolution: 128x64 (SCREEN_WIDTH=128, SCREEN_HEIGHT=64)  
+- I2C address: `0x3C` (OLED_ADDRESS)  
+- I2C pins used: SDA = D2, SCL = D1 (Wire.begin(D2, D1)) — verify for your board variant  
+- Init behavior: shows a bitmap splash (from `bitmap.h`) for 3000 ms (DISPLAY_INIT_DURATION) then clears and shows main UI  
+- Update cadence: internal throttle at 100 ms (DISPLAY_UPDATE_INTERVAL) and network strength refresh every 5000 ms (NETWORK_UPDATE_INTERVAL)
+- UI layout summary:
+  - Vertical divider at x=64 splits left history / right symbol area
+  - Top-right: connection indicator `TX` (upper) or `RX` (lower)
+  - Top-right corner: Wi‑Fi strength (4 chars, e.g., ` 75%` or ` OFF`)
+  - Left top: TX history shown over three 10-char lines
+  - Left bottom: RX history shown over three 10-char lines
+  - Right large area: current symbol or translated letter (textSize 6).  
+  - DIDACTIC mode: shows large translated letter briefly and a blinking cursor when idle.  
+  - MORSE mode: shows the typed Morse symbol (e.g., ".-") while being entered; shows most recent letter briefly after entry.
 
-Notas:
-- Botões: usar fiação para curto ao GND (INPUT_PULLUP).  
-- Buzzer passivo pode exigir transistor se corrente elevada.  
-- Se usar LED externo, colocar resistor adequado (ex.: 220 Ω).
-
----
-
-## Compilação e gravação
-
-Ambiente sugerido:
-- Arduino IDE com suporte ESP8266 instalado, ou PlatformIO (VS Code).  
-- Placa: selecionar modelo ESP8266 correto (NodeMCU, Wemos D1 mini, etc).  
-- Monitor serial: 115200 baud.
-
-Dependências:
-- Core ESP8266 (inclui `ESP8266WiFi`, `WiFiClient`, `ESP8266WiFiMulti`)  
-- Biblioteca do display usada em `display.*` (ex.: Adafruit SSD1306 ou U8g2 — verificar no arquivo `display`)
-
-Passos:
-1. Copie todos os arquivos para uma pasta de projeto (o `.ino` e os `.cpp/.h`).  
-2. Abra no Arduino IDE ou configure `platformio.ini` com `platform: espressif8266`.  
-3. Selecione porta e placa corretas.  
-4. Compile e faça upload.  
-5. Abra o Monitor Serial (115200) para acompanhar logs.
+Notes:
+- `initDisplay()` blocks for 3s while showing the splash; network scanning runs asynchronously during that time.  
+- Display code caches previous values and skips redraws when nothing changed to reduce SPI/I2C traffic.
 
 ---
 
-## Uso e testes rápidos
+## Minimal schematic / pinout
+- D5 — LOCAL button (INPUT_PULLUP; button shorts to GND)  
+- D6 — REMOTE input (INPUT_PULLUP)  
+- D8 — buzzer (digital ON/OFF) — passive buzzer may need a driver/transistor  
+- D4 — LED blinker (GPIO2; active HIGH)  
+- D2 = SDA, D1 = SCL — I2C for SSD1306 (verify board pin mapping)  
+- Power: 5V/USB or 3.3V depending on board (use proper regulator)
 
-1. Inicialização: ao ligar, o dispositivo inicia scan Wi‑Fi assíncrono, mostra splash no display e inicia o blinker. Confira logs serial.  
-2. Teste do buzzer e entrada local:
-   - Pressione o botão local (D5) e mantenha: buzzer deve ficar ON durante o pressionamento; ao soltar, o código registra Duration no Serial.
-   - Curtos/longos: duration <= 150 ms → ponto (`.`); >150 ms → traço (`-`).  
-3. Tradução de letra:
-   - Após release, aguarde `LETTER_GAP` (800 ms) sem novas pressões; `currentSymbol` é traduzido para letra e adicionada ao histórico (TX se local, RX se remoto).  
-4. Teste de rede (duas unidades):
-   - Ambas executando firmware podem se encontrar via SSID `morse-transceiver` (SSID aberto por padrão). Elas negociam roles por MAC e estabelecem TCP na porta 5000.
-   - Uma unidade envia `duration:<ms>\n` ao peer; o receptor converte em símbolo remoto.
+Notes:
+- Buttons should short to GND (INPUT_PULLUP).  
+- Use a current-limiting resistor for external LEDs (e.g., 220 Ω).  
+- Use a transistor for the buzzer if it draws more current than a GPIO can safely source.
+
+---
+
+## Build and flash
+
+Suggested environment:
+- Arduino IDE with ESP8266 core installed, or PlatformIO (VS Code)  
+- Select the correct ESP8266 board (NodeMCU, Wemos D1 mini, etc)  
+- Serial monitor: 115200 baud
+
+Dependencies:
+- ESP8266 core (includes `ESP8266WiFi`, `WiFiClient`, `ESP8266WiFiMulti`)  
+- Adafruit_GFX and Adafruit_SSD1306 libraries for the display
+
+Steps:
+1. Put all project files in a folder (the `.ino` plus `.cpp`/`.h`).  
+2. Open in Arduino IDE or configure `platformio.ini` with `platform: espressif8266`.  
+3. Select the correct board and port.  
+4. Compile and upload.  
+5. Open Serial Monitor at 115200 to follow logs.
+
+---
+
+## Quick usage and tests
+
+1. Startup: on power-up the device starts an async Wi‑Fi scan, shows the splash on the display, and starts the blinker. Check serial logs.  
+2. Buzzer and local input test:
+   - Press and hold the local button (D5): buzzer should be ON while pressed; on release the code logs the Duration to Serial.
+   - Short/long press: duration ≤ 150 ms → dot (`.`); >150 ms → dash (`-`).  
+3. Letter translation:
+   - After release, wait `LETTER_GAP` (800 ms) without new presses; the current symbol is translated to a letter and appended to history (TX for local, RX for remote).  
+4. Network test (two units):
+   - Two devices running the firmware can discover each other using SSID `morse-transceiver` (open SSID by default). They negotiate roles by MAC and establish TCP on port 5000.
+   - One unit sends `duration:<ms>\n` to the peer; the receiver converts it into a remote symbol.  
 5. Blinker:
-   - LED em D4 pisca mensagem padrão. Altere chamando `setBlinkerMessage("TEXTO")`.
+   - LED on D4 blinks the default message. Change it with `setBlinkerMessage("TEXT")`.
 
 ---
 
-## Protocolos e mensagens TCP
+## TCP protocol and messages
 
-Porta: `5000`
+Port: `5000`
 
-Mensagens (linha finaliza com `\n`):
-- `alive` — heartbeat enviado a cada 1s  
-- `duration:<ms>` — comunica duração de um press local ao peer  
-- `request_tx` — requisição para iniciar TX; resposta: `ok` ou `busy`  
-- `mac:<mac>` — negociação de roles por comparação de MAC
+Messages (each line ends with `\n`):
+- `alive` — heartbeat sent every 1s  
+- `duration:<ms>` — conveys a local press duration to the peer  
+- `request_tx` — request to start TX; response: `ok` or `busy`  
+- `mac:<mac>` — role negotiation based on MAC comparison
 
 Heartbeat:
-- Envia `alive` a cada `HEARTBEAT_INTERVAL` (1s).  
-- Se `HEARTBEAT_TIMEOUT` (3s) for ultrapassado sem receber `alive`, desconecta e vai para `DISCONNECTED`.
+- Sends `alive` every `HEARTBEAT_INTERVAL` (1s).  
+- If `HEARTBEAT_TIMEOUT` (3s) passes without receiving `alive`, the peer is disconnected and the state becomes `DISCONNECTED`.
 
 ---
 
-## APIs públicas (resumo para integradores)
+## Public APIs (integrator summary)
 
 cw-transceiver
 - `initCWTransceiver()`  
-- `updateCWTransceiver()` — chamar frequentemente (ex.: a cada 5 ms)  
+- `updateCWTransceiver()` — call frequently (e.g., every 5 ms)  
 - `getConnectionState()` → `FREE|TX|RX`  
 - `getMode()` → `DIDACTIC|MORSE`  
 - `getCurrentSymbol()`, `getHistoryTX()`, `getHistoryRX()`
 
 network
 - `initNetwork()`  
-- `updateNetwork()` — chamar periodicamente (ex.: a cada 100 ms)  
-- `occupyNetwork()` — retorna true se a rede está disponível para TX  
+- `updateNetwork()` — call periodically (e.g., every 100 ms)  
+- `occupyNetwork()` — returns true if the network is available for TX  
 - `isConnected()`  
 - `sendDuration(unsigned long duration)`  
-- `getNetworkStrength()` → `"###%"` ou `" OFF"`
+- `getNetworkStrength()` → `"###%"` or `" OFF"`
 
 blinker
 - `initBlinker()`  
 - `setBlinkerMessage(const char* newMessage)`  
-- `updateBlinker()` — chamar periodicamente (ex.: a cada 100 ms)
+- `updateBlinker()` — call periodically (e.g., every 100 ms)
 
-display (esperado)
-- `initDisplay()`  
-- `updateDisplay()` — deve exibir: `netState`, força do sinal, histórico, símbolo atual
+display
+- `initDisplay()` — initializes SSD1306, shows splash, then UI  
+- `updateDisplay()` — call regularly (project calls every 500 ms)
 
 ---
 
-## Valores e temporizações relevantes
+## Values and timing constants
 
 - `DEBOUNCE_TIME` = 25 ms  
-- `SHORT_PRESS` = 150 ms (<= → `.`)  
-- `LONG_PRESS` = 400 ms (uso especial: press >= `LONG_PRESS * 5` alterna modo)  
+- `SHORT_PRESS` = 150 ms (≤ → `.`)  
+- `LONG_PRESS` = 400 ms (special: press ≥ `LONG_PRESS * 5` toggles mode)  
 - `LETTER_GAP` (cw-transceiver) = 800 ms  
 - `INACTIVITY_TIMEOUT` = 5000 ms
 
@@ -135,38 +158,38 @@ Blinker:
 - `LETTER_GAP` = 600 ms  
 - `WORD_GAP` = 1800 ms
 
-Recomendação: alinhar DOT/DASH do blinker com `SHORT_PRESS` / `LONG_PRESS` para feedback coerente.
+Recommendation: align blinker DOT/DASH with `SHORT_PRESS` / `LONG_PRESS` for coherent audio/visual feedback.
 
 ---
 
-## Problemas comuns e soluções
+## Common issues and fixes
 
-- Display não aparece: verifique SDA/SCL e biblioteca usada; confirmar endereço I2C no `display.*`.  
-- Wi‑Fi repetidamente em AP_MODE: ver logs de scan; SSID aberto `morse-transceiver` é padrão.  
-- Buzzer não soa: confirme fiação no D8; buzzer passivo pode precisar de transistor.  
-- Debounce: ajustar `DEBOUNCE_TIME` se houver press/release espúrios.  
-- Tradução inválida: `translateMorse()` retorna `'\0'` se o símbolo não existe; adicionar fallback (`'?'`) se preferir.
-
----
-
-## Melhorias sugeridas
-- Tornar senha do SSID configurável (PASS vazio é inseguro).  
-- Resetar `retryDelay` em reconexão bem-sucedida e impor limite máximo de backoff.  
-- Implementar níveis de log (DEBUG/INFO) para reduzir `Serial.print` em produção.  
-- Validar/limitar `duration` recebidos via TCP.  
-- Sincronizar tempos entre blinker e cw-transceiver.  
-- Em `captureInput`, notificar display quando `occupyNetwork()` falhar.
+- Display not showing: verify SDA/SCL wiring (D2/D1) and the Adafruit SSD1306 library; confirm I2C address `0x3C`.  
+- Wi‑Fi stuck in AP_MODE: check scan logs; default SSID is open `morse-transceiver`.  
+- Buzzer silent: verify wiring on D8; passive buzzer might need a transistor.  
+- Debounce problems: adjust `DEBOUNCE_TIME` if spurious presses/releases occur.  
+- Failed translation: `translateMorse()` returns `'\0'` for unknown codes; add a fallback (`'?'`) if preferred.
 
 ---
 
-## Licença
-Adicionar um arquivo `LICENSE` (ex.: MIT) ao repositório se quiser permissões explícitas.
+## Suggested improvements
+- Make SSID password configurable (empty PASS is insecure by default).  
+- Reset `retryDelay` on successful reconnection and cap backoff.  
+- Add log levels (DEBUG/INFO) to reduce `Serial.print` noise in production.  
+- Validate/limit `duration` values received over TCP.  
+- Synchronize blinker timings with cw-transceiver thresholds.  
+- Notify the display when `occupyNetwork()` fails in `captureInput()`.
 
 ---
 
-## Contato e contribuição
-Abra issues ou PRs no repositório para:
-- correções de bugs  
-- adicionar suporte a displays diferentes  
-- melhorar o protocolo de rede (autenticação, reconexão robusta)  
-- sugestões de UX (feedback visual/sonoro)
+## License
+Add a `LICENSE` file (e.g., MIT) to the repository if you want explicit permissions.
+
+---
+
+## Contributing
+Open issues or PRs for:
+- bug fixes  
+- adding support for different displays  
+- improving the network protocol (authentication, robust reconnection)  
+- UX suggestions (visual/audio feedback)

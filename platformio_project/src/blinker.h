@@ -1,12 +1,5 @@
-#ifndef BLINKER_H
-#define BLINKER_H
+#pragma once
 
-#include <Arduino.h>
-
-void initBlinker(); // Configura LED e mensagem Morse inicial
-
-void setBlinkerMessage(const char* newMessage); // Define mensagem Morse
-
-void updateBlinker(); // Atualiza piscar do LED
-
-#endif
+void initBlinker();
+void startBlinker(const char* phrase);
+void updateBlinker();

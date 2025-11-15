@@ -5,7 +5,6 @@
 
 void initDisplay();
 void updateDisplay();
-
-extern const char* getNetworkStrength();  // De network.h
+extern const char* getNetworkStrength();
 
 #endif

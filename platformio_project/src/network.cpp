@@ -1,433 +1,404 @@
-#include "network.h"
-#include "cw-transceiver.h"  // Para captureInput(REMOTE, duration)
+/* network.cpp — Morse Transceiver v6.1
+   Gerencia Wi-Fi, heartbeat e mensagens DOWN/UP
+*/
 
-static ESP8266WiFiMulti wifiMulti;  // Não usado; mantido para compatibilidade
+#include "network.h"
+#include "cw-transceiver.h"
+#include <ESP8266WiFi.h>
+#include <ESP8266WiFiMulti.h>
+#include <stdarg.h>
+
+// LOG FLAGS (reduzidos por padrão)
+#define LOG_INIT     1
+#define LOG_UPDATE   1
+#define LOG_SCAN     1
+#define LOG_CONNECT  1
+#define LOG_AP       1
+#define LOG_RX       1
+#define LOG_TX       1
+#define LOG_STRENGTH 1
+
+static ESP8266WiFiMulti wifiMulti;
 static WiFiServer server(5000);
 static WiFiClient client;
+
 static const char* SSID = "morse-transceiver";
-static const char* PASS = "";  // Sem senha para simplicidade
+static const char* PASS = "";
+
 static const IPAddress AP_IP(192, 168, 4, 1);
-static const unsigned long SCAN_TIMEOUT = 5000;  // Timeout per scan attempt
-static const unsigned long SCAN_INTERVAL = 500;  // Intervalo para verificar scan
-static const unsigned long CONNECT_TIMEOUT = 5000;  // 5s for connect
-static const unsigned long RETRY_INTERVAL_BASE = 10000;  // Retry STA base 10s
-static const unsigned long STATUS_CHECK_INTERVAL = 5000;  // Check WiFi.status() a cada 5s
-static const unsigned long HEARTBEAT_INTERVAL = 1000;  // Send "alive" every 1s when connected
-static const unsigned long HEARTBEAT_TIMEOUT = 3000;  // Timeout if no heartbeat
+
 static unsigned long lastHeartbeatSent = 0;
 static unsigned long lastHeartbeatReceived = 0;
 static unsigned long lastStatusCheck = 0;
 static unsigned long lastScan = 0;
 static unsigned long connectStart = 0;
 static unsigned long lastRetry = 0;
-static unsigned long retryDelay = RETRY_INTERVAL_BASE;  // Backoff inicia 10s
+static unsigned long retryDelay = 10000;
+
 static int scanAttempts = 0;
 static bool scanInProgress = false;
-static bool scanPollingPrinted = false;  // To avoid repetition
-static int lastScanResult = -2;  // Último resultado de scanComplete para evitar prints repetidos
-static int asyncFailCount = 0;  // Contador de falhas de scan assíncrono
-NetworkState netState = SCANNING;  // Definido como extern no header
+static int lastScanResult = -2;
+
+NetworkState netState = SCANNING;
+static bool actingAsClient = false;
+
+static const unsigned long SCAN_INTERVAL_MS = 800;
+static const unsigned long SCAN_TIMEOUT_MS = 7000;
+static const int MAX_SCAN_ATTEMPTS = 3;
+static const unsigned long CONNECT_RETRY_MS = 4000;
+static const unsigned long CONNECT_WIFI_TIMEOUT_MS = 5000;
+
+static const unsigned long HEARTBEAT_INTERVAL_ACTIVE_MS = 1000;
+static const unsigned long HEARTBEAT_INTERVAL_IDLE_MS   = 10000;
+static const unsigned long HEARTBEAT_TIMEOUT_ACTIVE_MS  = 8000;
+static const unsigned long HEARTBEAT_TIMEOUT_IDLE_MS    = 30000;
+
+static char peerIPbuf[16] = "";
+static char lastNetEventBuf[32] = "";
+static unsigned long lastNetEventAt = 0;
+
+static void log_if(bool flag, const char *fmt, ...) {
+  if (!flag) return;
+  va_list args;
+  va_start(args, fmt);
+  vprintf(fmt, args);
+  va_end(args);
+  printf("\n");
+}
+
+static void safe_strncpy(char* dst, const char* src, size_t n) {
+  if (!dst) return;
+  if (!src) { dst[0] = '\0'; return; }
+  strncpy(dst, src, n-1);
+  dst[n-1] = '\0';
+}
 
 void initNetwork() {
   unsigned long now = millis();
-  randomSeed(analogRead(0));  // Seed for random
-  delay(random(0, 2000));  // Random delay to desincronizar starts
-  Serial.print(now);
-  Serial.print(" - Random delay de ");
-  Serial.print(random(0, 2000));
-  Serial.println(" ms para desincronizar");
-  WiFi.mode(WIFI_STA);  // Inicia como STA for scan/conexão during splash
-  WiFi.setPhyMode(WIFI_PHY_MODE_11G);  // For stability
-  WiFi.scanNetworks(true, true);  // Async scan, mostrar ocultas
+  randomSeed(analogRead(0));
+  delay(random(0, 1500));
+
+  WiFi.mode(WIFI_STA);
+  WiFi.setPhyMode(WIFI_PHY_MODE_11G);
+
+  WiFi.scanNetworks(true, true);
   scanInProgress = true;
-  scanPollingPrinted = false;
-  lastScan = now;
   scanAttempts = 1;
-  asyncFailCount = 0;
-  Serial.print(now);
-  Serial.println(" - Iniciando busca async por SSID: morse-transceiver (STA primeiro during splash)");
+  lastScan = now;
+
+  server.begin();
+
+  netState = SCANNING;
+
+  log_if(LOG_INIT, "%lu - Network init state=%d", now, netState);
 }
 
-// Atualização não bloqueante
+static void updateLastEvent(const char* fmt, ...) {
+  va_list ap;
+  va_start(ap, fmt);
+  vsnprintf(lastNetEventBuf, sizeof(lastNetEventBuf), fmt, ap);
+  va_end(ap);
+  lastNetEventAt = millis();
+}
+
+static void sendLineToClient(const char* line) {
+  if (client && client.connected()) {
+    client.print(line);
+    client.print("\n");
+    client.flush();
+    log_if(LOG_TX, "%lu - Sent: %s", millis(), line);
+    updateLastEvent("TX:%s", line);
+  } else {
+    log_if(LOG_TX, "%lu - sendLineToClient: no client", millis());
+  }
+}
+
+void network_sendDown() {
+  if (client && client.connected()) {
+    sendLineToClient("DOWN");
+  } else {
+    log_if(LOG_TX, "%lu - network_sendDown: no client", millis());
+  }
+}
+
+void network_sendUp() {
+  if (client && client.connected()) {
+    sendLineToClient("UP");
+  } else {
+    log_if(LOG_TX, "%lu - network_sendUp: no client", millis());
+  }
+}
+
+void sendDuration(unsigned long duration) {
+  if (isConnected() && client.connected()) {
+    char buf[32];
+    snprintf(buf, sizeof(buf), "duration:%lu", duration);
+    sendLineToClient(buf);
+  } else {
+    log_if(LOG_TX, "%lu - sendDuration: no client", millis());
+  }
+}
+
 void updateNetwork() {
   unsigned long now = millis();
-  WiFiClient newClient;  // Evita cruzamento em switch
-  // Check WiFi.status() periodicamente
-  if (now - lastStatusCheck > STATUS_CHECK_INTERVAL) {
-    Serial.print(now);
-    Serial.print(" - WiFi status: ");
-    uint8_t status = WiFi.status();
-    Serial.print(status);
-    Serial.print(" (");
-    switch (status) {
-      case WL_IDLE_STATUS: Serial.print("IDLE"); break;
-      case WL_NO_SSID_AVAIL: Serial.print("NO SSID"); break;
-      case WL_SCAN_COMPLETED: Serial.print("SCAN COMPLETED"); break;
-      case WL_CONNECTED: Serial.print("CONNECTED"); break;
-      case WL_CONNECT_FAILED: Serial.print("CONNECT FAILED"); break;
-      case WL_CONNECTION_LOST: Serial.print("CONNECTION LOST"); break;
-      case WL_DISCONNECTED: Serial.print("DISCONNECTED"); break;
-      default: Serial.print("UNKNOWN"); break;
-    }
-    Serial.println(")");
+
+  if (now - lastStatusCheck > 5000) {
+    log_if(LOG_UPDATE, "%lu - WiFi.status: %d netState: %d client.connected: %d",
+           now, WiFi.status(), netState, client.connected());
     lastStatusCheck = now;
   }
 
   switch (netState) {
     case SCANNING: {
-      if (now - lastScan < SCAN_INTERVAL) break;  // Verifica a cada 500ms
+      if (now - lastScan < SCAN_INTERVAL_MS) break;
       int n = WiFi.scanComplete();
-      if (n != lastScanResult) {
-        Serial.print(now);
-        Serial.print(" - scanComplete returned: ");
-        Serial.println(n);
-        lastScanResult = n;
-      }
       if (n == WIFI_SCAN_RUNNING) {
-        if (!scanPollingPrinted) {
-          Serial.print(now);
-          Serial.println(" - Scan em andamento...");
-          scanPollingPrinted = true;
-        }
-        if (now - lastScan > SCAN_TIMEOUT) {
-          Serial.print(now);
-          Serial.println(" - Scan timeout; assumindo falha, incrementando tentativa");
-          WiFi.scanDelete();  // Limpa scan travado
+        if (now - lastScan > SCAN_TIMEOUT_MS) {
+          WiFi.scanDelete();
           scanInProgress = false;
-          scanPollingPrinted = false;
-          lastScanResult = -2;
           scanAttempts++;
-          asyncFailCount++;
         }
-      } else if (n == WIFI_SCAN_FAILED) {
-        Serial.print(now);
-        Serial.println(" - Scan falhou; tentando novamente");
-        asyncFailCount++;
-        WiFi.scanDelete();
-        scanInProgress = false;
-        scanPollingPrinted = false;
-        lastScanResult = -2;
-        scanAttempts++;
-      } else if (n >= 0 && scanAttempts <= 3) {
-        scanInProgress = false;
-        scanPollingPrinted = false;
-        lastScanResult = -2;
-        Serial.print(now);
-        Serial.print(" - Redes encontradas na tentativa ");
-        Serial.print(scanAttempts);
-        Serial.println(":");
+      } else if (n >= 0 && scanAttempts <= MAX_SCAN_ATTEMPTS) {
         bool found = false;
-        int targetChannel = 1;  // Default channel
-        String targetBSSID = "";  // Para eleição
-        int bestRSSI = -200;  // Para escolher melhor
-        int numSameSSID = 0;
+        int targetCh = 1;
         for (int i = 0; i < n; ++i) {
-          Serial.print(now);
-          Serial.print(" - SSID: ");
-          Serial.print(WiFi.SSID(i));
-          Serial.print(", RSSI: ");
-          Serial.print(WiFi.RSSI(i));
-          Serial.print(" dBm, Canal: ");
-          Serial.print(WiFi.channel(i));
-          Serial.print(", Encryption: ");
-          Serial.print(WiFi.encryptionType(i));
-          Serial.print(", BSSID: ");
-          Serial.println(WiFi.BSSIDstr(i));
           if (strcmp(WiFi.SSID(i).c_str(), SSID) == 0) {
-            numSameSSID++;
-            if (WiFi.RSSI(i) > bestRSSI) {
-              bestRSSI = WiFi.RSSI(i);
-              targetChannel = WiFi.channel(i);
-              targetBSSID = WiFi.BSSIDstr(i);
-            }
+            found = true;
+            targetCh = WiFi.channel(i);
+            break;
           }
         }
-        WiFi.scanDelete();  // Limpa resultados após processar
-        if (numSameSSID > 1) {
-          Serial.print(now);
-          Serial.println(" - Múltiplos APs com mesmo SSID; iniciando negociação");
-          WiFi.begin(SSID, PASS, targetChannel);  // Conecta ao melhor canal
+        WiFi.scanDelete();
+
+        if (found) {
+          WiFi.begin(SSID, PASS, targetCh);
           netState = CONNECTING;
           connectStart = now;
-        } else if (numSameSSID == 1) {
-          found = true;
-          Serial.print(now);
-          Serial.println(" - SSID alvo encontrado, iniciando conexão como STA");
-          WiFi.begin(SSID, PASS, targetChannel);
-          netState = CONNECTING;
-          connectStart = now;
-          WiFi.printDiag(Serial);  // Diagnóstico: modo, status, etc.
+          lastRetry = now;
         } else {
-          Serial.print(now);
-          Serial.print(" - Tentativa ");
-          Serial.print(scanAttempts);
-          Serial.println(" sem SSID alvo; proximo scan");
-          WiFi.scanNetworks(true);
-          scanInProgress = true;
-          scanPollingPrinted = false;
-          lastScan = now;
           scanAttempts++;
+          if (scanAttempts > MAX_SCAN_ATTEMPTS) {
+            WiFi.mode(WIFI_AP_STA);
+            int apChannel = 1;
+            WiFi.softAP(SSID, PASS, apChannel);
+            server.begin();
+            netState = AP_MODE;
+            lastRetry = now;
+            updateLastEvent("AP_MODE");
+          } else {
+            WiFi.scanNetworks(true, true);
+            scanInProgress = true;
+            lastScan = now;
+          }
         }
-      }
-      if (scanAttempts > 3 && !scanInProgress) {
-        Serial.print(now);
-        Serial.println(" - Nenhum SSID alvo encontrado após tentativas ou falhas; iniciando AP e mantendo STA retry (dual mode)");
+      } else if (scanAttempts > MAX_SCAN_ATTEMPTS) {
         WiFi.mode(WIFI_AP_STA);
-        WiFi.softAP(SSID, PASS, 1);  // Inicia AP no canal 1
-        Serial.print(now);
-        Serial.print(" - AP iniciado com SSID: ");
-        Serial.print(SSID);
-        Serial.print(", IP: ");
-        Serial.print(WiFi.softAPIP());
-        Serial.print(", MAC: ");
-        Serial.print(WiFi.softAPmacAddress());
-        Serial.print(", Clientes conectados: ");
-        Serial.println(WiFi.softAPgetStationNum());
-        WiFi.printDiag(Serial);  // Diagnóstico AP+STA
+        int apChannel = 1;
+        WiFi.softAP(SSID, PASS, apChannel);
         server.begin();
         netState = AP_MODE;
         lastRetry = now;
-        asyncFailCount = 0;
-        // Tentar scan síncrono como fallback
-        Serial.print(now);
-        Serial.println(" - Tentando scan síncrono como fallback");
-        int n = WiFi.scanNetworks(false, true);  // Scan síncrono
-        Serial.print(now);
-        Serial.print(" - Scan síncrono retornou: ");
-        Serial.println(n);
-        if (n > 0) {
-          for (int i = 0; i < n; ++i) {
-            Serial.print(now);
-            Serial.print(" - SSID: ");
-            Serial.print(WiFi.SSID(i));
-            Serial.print(", RSSI: ");
-            Serial.print(WiFi.RSSI(i));
-            Serial.print(" dBm, Canal: ");
-            Serial.print(WiFi.channel(i));
-            Serial.print(", Encryption: ");
-            Serial.print(WiFi.encryptionType(i));
-            Serial.print(", BSSID: ");
-            Serial.println(WiFi.BSSIDstr(i));
-            if (strcmp(WiFi.SSID(i).c_str(), SSID) == 0) {
-              Serial.print(now);
-              Serial.println(" - SSID alvo encontrado em scan síncrono, iniciando conexão");
-              WiFi.begin(SSID, PASS, WiFi.channel(i));
-              netState = CONNECTING;
-              connectStart = now;
-              break;
+        updateLastEvent("AP_MODE");
+      } else {
+        WiFi.scanNetworks(true, true);
+        scanInProgress = true;
+        lastScan = now;
+      }
+    } break;
+
+    case CONNECTING: {
+      if (WiFi.status() == WL_CONNECTED) {
+        if (WiFi.softAPgetStationNum() > 0) {
+          netState = CONNECTED;
+          lastHeartbeatReceived = now;
+          updateLastEvent("LOCAL_STA_PRESENT");
+          break;
+        }
+
+        if (WiFi.localIP() == AP_IP) {
+          netState = AP_MODE;
+          updateLastEvent("SKIP_SELF_CONNECT");
+          break;
+        }
+
+        if (now - connectStart > CONNECT_RETRY_MS) {
+          if (client.connect(AP_IP, 5000)) {
+            netState = CONNECTED;
+            actingAsClient = true;
+            lastHeartbeatSent = now;
+            lastHeartbeatReceived = now;
+            safe_strncpy(peerIPbuf, AP_IP.toString().c_str(), sizeof(peerIPbuf));
+            updateLastEvent("CONNECT");
+          } else {
+            connectStart = now;
+            lastRetry = now;
+          }
+        }
+      } else if (now - connectStart > CONNECT_WIFI_TIMEOUT_MS) {
+        netState = DISCONNECTED;
+        lastRetry = now;
+        updateLastEvent("CONNECT_TIMEOUT");
+      }
+    } break;
+
+    case CONNECTED: {
+      if (!client.connected()) {
+        netState = DISCONNECTED;
+        lastRetry = now;
+        actingAsClient = false;
+        updateLastEvent("TCP_LOST");
+        break;
+      }
+
+      unsigned long hbInterval = (getConnectionState() == FREE) ? HEARTBEAT_INTERVAL_IDLE_MS : HEARTBEAT_INTERVAL_ACTIVE_MS;
+      unsigned long hbTimeout  = (getConnectionState() == FREE) ? HEARTBEAT_TIMEOUT_IDLE_MS : HEARTBEAT_TIMEOUT_ACTIVE_MS;
+
+      if (actingAsClient && (now - lastHeartbeatSent > hbInterval)) {
+        sendLineToClient("alive");
+        lastHeartbeatSent = now;
+      }
+
+      if (now - lastHeartbeatReceived > hbTimeout) {
+        client.stop();
+        actingAsClient = false;
+        netState = DISCONNECTED;
+        lastRetry = now;
+        updateLastEvent("HB_TIMEOUT");
+        break;
+      }
+
+      while (client.available()) {
+        String line = client.readStringUntil('\n');
+        line.trim();
+
+        if (line == "alive") {
+          lastHeartbeatReceived = now;
+          if (!actingAsClient) {
+            sendLineToClient("alive_ack");
+          }
+          updateLastEvent("RX:alive");
+        } else if (line == "alive_ack") {
+          if (actingAsClient) lastHeartbeatReceived = now;
+          updateLastEvent("RX:alive_ack");
+        } else if (line == "DOWN") {
+          injectRemoteDown();
+          updateLastEvent("RX:DOWN");
+        } else if (line == "UP") {
+          injectRemoteUp();
+          updateLastEvent("RX:UP");
+        } else if (line == "request_tx") {
+          if (getConnectionState() == FREE) sendLineToClient("ok");
+          else sendLineToClient("busy");
+          updateLastEvent("RX:req_tx");
+        } else if (line.startsWith("mac:")) {
+          updateLastEvent("RX:mac");
+        } else if (line.startsWith("duration:")) {
+          updateLastEvent("RX:duration");
+        } else {
+          updateLastEvent("RX:unknown");
+        }
+      }
+    } break;
+
+    case AP_MODE: {
+      yield();
+      WiFiClient newClient = server.accept();
+      if (newClient && !client.connected()) {
+        client = newClient;
+        String myMac = WiFi.macAddress();
+        client.print("mac:" + myMac + "\n");
+        actingAsClient = false;
+        lastHeartbeatReceived = now;
+        lastHeartbeatSent = now;
+        safe_strncpy(peerIPbuf, client.remoteIP().toString().c_str(), sizeof(peerIPbuf));
+        updateLastEvent("ACCEPT");
+      } else if (newClient && client.connected()) {
+        newClient.stop();
+      }
+
+      if (client.connected()) {
+        unsigned long hbTimeoutAP = (getConnectionState() == FREE) ? HEARTBEAT_TIMEOUT_IDLE_MS : HEARTBEAT_TIMEOUT_ACTIVE_MS;
+        if (now - lastHeartbeatReceived > hbTimeoutAP) {
+          client.stop();
+          netState = DISCONNECTED;
+          lastRetry = now;
+          updateLastEvent("AP_HB_TIMEOUT");
+        }
+
+        while (client.available()) {
+          String line = client.readStringUntil('\n');
+          line.trim();
+          if (line == "alive") {
+            lastHeartbeatReceived = now;
+            sendLineToClient("alive_ack");
+            updateLastEvent("AP_RX:alive");
+          } else if (line == "DOWN") {
+            injectRemoteDown();
+            updateLastEvent("AP_RX:DOWN");
+          } else if (line == "UP") {
+            injectRemoteUp();
+            updateLastEvent("AP_RX:UP");
+          } else if (line == "request_tx") {
+            if (getConnectionState() == FREE) sendLineToClient("ok");
+            else sendLineToClient("busy");
+            updateLastEvent("AP_RX:req_tx");
+          }
+        }
+      }
+
+      if (now - lastRetry > retryDelay) {
+        if (WiFi.softAPgetStationNum() == 0) {
+          int n2 = WiFi.scanNetworks(false, true);
+          bool foundOther = false;
+          int otherCh = 1;
+          if (n2 > 0) {
+            for (int i = 0; i < n2; ++i) {
+              if (strcmp(WiFi.SSID(i).c_str(), SSID) == 0) {
+                foundOther = true;
+                otherCh = WiFi.channel(i);
+                break;
+              }
             }
           }
           WiFi.scanDelete();
-        }
-      } else if (!scanInProgress) {
-        // Iniciar próximo scan
-        WiFi.scanNetworks(true, true);
-        Serial.print(now);
-        Serial.println(" - Iniciando novo scan assíncrono");
-        scanInProgress = true;
-        scanPollingPrinted = false;
-        lastScan = now;
-        lastScanResult = -2;
-      }
-      break;
-    }
-    case CONNECTING:
-      if (WiFi.status() == WL_CONNECTED) {
-        Serial.print(now);
-        Serial.println(" - Conectado como STA; conectando TCP ao servidor");
-        WiFi.printDiag(Serial);  // Diagnóstico STA
-        if (client.connect(AP_IP, 5000)) {
-          netState = CONNECTED;
-          Serial.print(now);
-          Serial.println(" - TCP cliente conectado");
-          // Iniciar negotiation if needed (ex.: send MAC)
+          if (foundOther) {
+            WiFi.begin(SSID, PASS, otherCh);
+            netState = CONNECTING;
+            connectStart = now;
+            lastRetry = now;
+            updateLastEvent("AP_DETECTED_JOIN");
+          } else {
+            lastRetry = now;
+            retryDelay = min<unsigned long>(retryDelay + 5000, 60000);
+            updateLastEvent("AP_BACKOFF");
+          }
         } else {
-          Serial.print(now);
-          Serial.println(" - Falha TCP cliente (verifique se AP está ativo no peer); retry em 5s");
-          connectStart = now;
-          WiFi.printDiag(Serial);  // Diagnóstico falha
-        }
-      } else if (now - connectStart > CONNECT_TIMEOUT) {
-        Serial.print(now);
-        Serial.println(" - Timeout conexão STA; indo para DISCONNECTED");
-        netState = DISCONNECTED;
-        lastRetry = now;
-        WiFi.printDiag(Serial);  // Diagnóstico falha
-      }
-      break;
-    case CONNECTED:
-      if (!client.connected()) {
-        netState = DISCONNECTED;
-        Serial.print(now);
-        Serial.println(" - TCP desconectado; indo para DISCONNECTED");
-        lastRetry = now;
-      } else {
-        // Heartbeat
-        if (now - lastHeartbeatSent > HEARTBEAT_INTERVAL) {
-          client.print("alive\n");
-          client.flush();
-          lastHeartbeatSent = now;
-          Serial.print(now);
-          Serial.println(" - Enviado heartbeat 'alive'");
-        }
-        if (now - lastHeartbeatReceived > HEARTBEAT_TIMEOUT) {
-          Serial.print(now);
-          Serial.println(" - Heartbeat timeout; indo para DISCONNECTED");
-          client.stop();
-          netState = DISCONNECTED;
           lastRetry = now;
-        }
-        // Receber pacotes
-        while (client.available()) {
-          String line = client.readStringUntil('\n');
-          line.trim();
-          if (line == "alive") {
-            lastHeartbeatReceived = now;
-            Serial.print(now);
-            Serial.println(" - Recebido heartbeat 'alive'");
-          } else if (line.startsWith("duration:")) {
-            unsigned long dur = line.substring(9).toInt();
-            if (dur >= 25) {
-              Serial.print(now);
-              Serial.print(" - Recebido duration remoto: ");
-              Serial.println(dur);
-              captureInput(REMOTE, dur);
-            }
-          } else if (line == "request_tx") {
-            if (getConnectionState() == FREE) {
-              client.print("ok\n");
-              client.flush();
-              Serial.print(now);
-              Serial.println(" - Enviado 'ok' para request_tx");
-            } else {
-              client.print("busy\n");
-              client.flush();
-              Serial.print(now);
-              Serial.println(" - Enviado 'busy' para request_tx");
-            }
-          } else if (line.startsWith("mac:")) {
-            String remoteMac = line.substring(4);
-            String myMac = WiFi.macAddress();
-            if (myMac > remoteMac && WiFi.getMode() == WIFI_AP_STA) {
-              Serial.print(now);
-              Serial.println(" - Meu MAC é maior; revertendo para STA");
-              WiFi.softAPdisconnect(true);
-              WiFi.mode(WIFI_STA);
-              WiFi.begin(SSID, PASS);
-              netState = CONNECTING;
-              connectStart = now;
-            } else {
-              Serial.print(now);
-              Serial.println(" - Meu MAC é menor; permanecendo como AP");
-            }
-          }
+          retryDelay = min<unsigned long>(retryDelay + 5000, 60000);
+          updateLastEvent("AP_STAY");
         }
       }
-      break;
-    case AP_MODE:
-      newClient = server.available();
-      if (newClient && !client.connected()) {
-        client = newClient;
-        Serial.print(now);
-        Serial.println(" - Cliente TCP conectado ao AP");
-        Serial.print(now);
-        Serial.print(" - Clientes conectados: ");
-        Serial.println(WiFi.softAPgetStationNum());
-        // Enviar MAC para negociação
-        String myMac = WiFi.macAddress();
-        client.print("mac:" + myMac + "\n");
-        client.flush();
-        Serial.print(now);
-        Serial.print(" - Enviado MAC para negociação: ");
-        Serial.println(myMac);
-      }
-      if (client.connected()) {
-        // Heartbeat
-        if (now - lastHeartbeatSent > HEARTBEAT_INTERVAL) {
-          client.print("alive\n");
-          client.flush();
-          lastHeartbeatSent = now;
-          Serial.print(now);
-          Serial.println(" - Enviado heartbeat 'alive'");
-        }
-        if (now - lastHeartbeatReceived > HEARTBEAT_TIMEOUT) {
-          Serial.print(now);
-          Serial.println(" - Heartbeat timeout; indo para DISCONNECTED");
-          client.stop();
-          netState = DISCONNECTED;
-          lastRetry = now;
-        }
-        // Receber pacotes
-        while (client.available()) {
-          String line = client.readStringUntil('\n');
-          line.trim();
-          if (line == "alive") {
-            lastHeartbeatReceived = now;
-            Serial.print(now);
-            Serial.println(" - Recebido heartbeat 'alive'");
-          } else if (line.startsWith("duration:")) {
-            unsigned long dur = line.substring(9).toInt();
-            if (dur >= 25) {
-              Serial.print(now);
-              Serial.print(" - Recebido duration remoto (AP): ");
-              Serial.println(dur);
-              captureInput(REMOTE, dur);
-            }
-          } else if (line == "request_tx") {
-            if (getConnectionState() == FREE) {
-              client.print("ok\n");
-              client.flush();
-              Serial.print(now);
-              Serial.println(" - Enviado 'ok' para request_tx");
-            } else {
-              client.print("busy\n");
-              client.flush();
-              Serial.print(now);
-              Serial.println(" - Enviado 'busy' para request_tx");
-            }
-          } else if (line.startsWith("mac:")) {
-            String remoteMac = line.substring(4);
-            String myMac = WiFi.macAddress();
-            if (myMac > remoteMac) {
-              Serial.print(now);
-              Serial.println(" - Meu MAC é maior; revertendo para STA");
-              WiFi.softAPdisconnect(true);
-              WiFi.mode(WIFI_STA);
-              WiFi.begin(SSID, PASS);
-              netState = CONNECTING;
-              connectStart = now;
-            } else {
-              Serial.print(now);
-              Serial.println(" - Meu MAC é menor; permanecendo como AP");
-            }
-          }
-        }
-      }
-      // Tentar reconexão como STA em dual mode
-      if (now - lastRetry > retryDelay) {
-        Serial.print(now);
-        Serial.println(" - Tentando reconexão STA em AP_MODE");
-        WiFi.begin(SSID, PASS);
-        netState = CONNECTING;
-        connectStart = now;
-        lastRetry = now;
-        retryDelay += 5000;
-      }
-      break;
-    case DISCONNECTED:
-      if (now - lastRetry > retryDelay) {
-        Serial.print(now);
-        Serial.println(" - Retry conexão STA em DISCONNECTED");
-        netState = CONNECTING;
-        connectStart = now;
-        lastRetry = now;
-        retryDelay += 5000;
-        WiFi.begin(SSID, PASS);
-      }
-      break;
-  }
-}
+    } break;
 
+    case DISCONNECTED: {
+      if (now - lastRetry > retryDelay) {
+        WiFi.begin(SSID, PASS);
+        netState = CONNECTING;
+        connectStart = now;
+        lastRetry = now;
+        retryDelay = min<unsigned long>(retryDelay + 5000, 60000);
+        updateLastEvent("RETRY_JOIN");
+      }
+    } break;
+
+    default:
+      netState = SCANNING;
+      updateLastEvent("RESET_SCAN");
+      break;
+  } // switch
+} // updateNetwork
+
+// helpers
 bool occupyNetwork() {
   return isConnected();
 }
@@ -436,28 +407,37 @@ bool isConnected() {
   return (netState == CONNECTED || (netState == AP_MODE && client.connected()));
 }
 
-void sendDuration(unsigned long duration) {
-  unsigned long now = millis();
-  if (isConnected() && client.connected()) {
-    client.print("duration:");
-    client.print(duration);
-    client.print("\n");
-    client.flush();
-    Serial.print(now);
-    Serial.print(" - Enviado duration local: ");
-    Serial.println(duration);
-  }
+const char* getNetworkRole() {
+  if (netState == AP_MODE) return "AP";
+  if (netState == CONNECTED && actingAsClient) return "CLIENT";
+  if (netState == CONNECTED && !actingAsClient) return "PEER";
+  return "NONE";
+}
+
+const char* getPeerIP() {
+  return peerIPbuf;
+}
+
+const char* getLastNetworkEvent() {
+  return lastNetEventBuf;
+}
+
+unsigned long getLastNetworkEventAt() {
+  return lastNetEventAt;
 }
 
 const char* getNetworkStrength() {
-  static char strength[5];  // "100%", " OFF"
-  if (netState == CONNECTED && WiFi.status() == WL_CONNECTED) {
+  static char strength[8];
+  if ((netState == CONNECTED || netState == CONNECTING) && WiFi.status() == WL_CONNECTED) {
     long rssi = WiFi.RSSI();
     int percent = constrain(map(rssi, -100, -50, 0, 100), 0, 100);
-    sprintf(strength, "%3d%%", percent);
+    snprintf(strength, sizeof(strength), "%3d%%", percent);
+    return strength;
+  } else if (netState == AP_MODE && WiFi.softAPgetStationNum() > 0) {
+    strcpy(strength, "100%");
     return strength;
   } else {
-    strcpy(strength, " OFF");
+    strcpy(strength, "OFF");
     return strength;
   }
 }

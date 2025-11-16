@@ -1,253 +1,211 @@
-# morse-transceiver Documentation
+# Morse Transceiver — Core Documentation
 
-## Project overview
+## 1. Overview
 
-morse-transceiver is an ESP8266-based CW (Morse) transceiver firmware that lets two units exchange Morse keying locally (button + buzzer) and remotely over Wi‑Fi/TCP. It provides visual feedback on an SSD1306 OLED and via an LED blinker. The firmware is non-blocking (millis()/yield()) and built for reproducible builds and stable releases.
-
-Key features
-- Local key input (button + buzzer) and remote key input (duration messages over TCP)
-- Connection states: FREE, TX, RX — network is occupied during local TX
-- Simple text TCP protocol on port 5000: `alive`, `duration:<ms>`, `request_tx`, `ok`/`busy`, `mac:<mac>`
-- Didactic vs Morse display modes (toggle by long press)
-- TX / RX character history buffers
-- LED blinker that flashes configurable Morse messages
-- Non-blocking architecture suitable for ESP8266
+Modular firmware for ESP8266 implementing a CW (Morse) transceiver with both local input (physical button) and remote input (Wi-Fi/TCP). The system provides sound feedback via a **buzzer**, visual feedback via an **OLED SSD1306**, and a **LED blinker**. The architecture is fully **non-blocking**, based on `millis()` + `yield()`, ensuring responsiveness and multitasking.
 
 ---
 
-## Hardware and pinout
+## 2. File and Module Structure
 
-Recommended components
-- ESP8266 module (NodeMCU, Wemos D1 mini)
-- Momentary button(s) wired to ground (INPUT_PULLUP)
-- Buzzer (or small speaker; use transistor if needed)
-- Status LED (external or on-board)
-- 128x64 SSD1306 I2C OLED display
-
-Pin mapping (as used in the code)
-- D5 — LOCAL button (INPUT_PULLUP)
-- D6 — REMOTE input (INPUT_PULLUP)
-- D8 — BUZZER output
-- D4 — LED blinker (GPIO2, active HIGH)
-- I2C (SSD1306) — commonly D1 = SCL, D2 = SDA (Wire.begin(D2, D1) in code)
-
-Hardware notes
-- Buttons should short to GND (internal pull-ups enabled).  
-- Passive buzzers may require a transistor or driver.  
-- Use series resistors for external LEDs (e.g., 220 Ω).  
-- Verify I2C pin mapping for your board variant.
+| Module / File       | Main Responsibility                        | Interactions                      |
+| ------------------- | ------------------------------------------ | --------------------------------- |
+| `main.cpp`          | Entry point; module integration; callbacks | Calls `init`/`update` for all     |
+| `morse-key.*`       | Physical button events (ISR + debounce)    | Telegrapher, History              |
+| `telegrapher.*`     | Morse classification, translation, modes   | History, Network-State, Display   |
+| `morse-telecom.*`   | Text-based TCP protocol                    | Network-Connect, Telegrapher      |
+| `network-state.*`   | FSM: FREE/TX/RX                            | Buzzer, Display                   |
+| `network-connect.*` | Wi-Fi/TCP: scanning, connection, heartbeat | Network-State, Telecom            |
+| `history.*`         | Circular TX/RX buffers (30 chars)          | Display reads, Telegrapher writes |
+| `display-adapter.*` | OLED UI: splash, redraw, caching           | Telegrapher, Network-State        |
+| `buzzer-driver.*`   | Non-blocking buzzer driver                 | Telegrapher, Network-State        |
+| `blinker.*`         | LED blinker (phrase → Morse → LED)         | Translator                        |
+| `translator.*`      | ASCII ↔ Morse lookup table                 | Telegrapher, Blinker              |
+| `bitmap.h`          | Bitmap for splash screen                   | Display                           |
 
 ---
 
-## Source structure and startup flow
+## 3. Header Pattern and Log Flags
 
-Files (present in repository)
-- morse-project.ino — main orchestration (setup and loop)
-- cw-transceiver.cpp / .h — core CW logic: input capture, debounce, buzzer, translation, history
-- network.cpp / .h — Wi‑Fi & TCP FSM, peer negotiation, heartbeat and message handling
-- blinker.cpp / .h — converts text to Morse and blinks LED
-- display.cpp / .h — SSD1306 UI, splash bitmap, display caching and refresh
-- bitmap.h — splash bitmap (optional)
+All source files follow:
 
-Startup sequence
-1. Serial.begin(115200)
-2. initNetwork() — starts async Wi‑Fi scan (STA mode) with randomized delay
-3. initDisplay() — initializes SSD1306, shows bitmap splash (3s)
-4. initCWTransceiver() — configures buttons and buzzer
-5. initBlinker() — configures LED and default message
+```cpp
+// File: name.ext vX.X
+// Description: explanation
+// Last modification: description
+// Modified: YYYY-MM-DD HH:MM
+// Created: YYYY-MM-DD
+```
 
-Main loop (non-blocking)
-- updateCWTransceiver() — every ~5 ms (input responsiveness)
-- updateDisplay() — every ~500 ms (UI)
-- updateBlinker() — every ~100 ms (LED Morse)
-- updateNetwork() — every ~100 ms (network FSM)
-- yield() — to allow ESP8266 background tasks
+Directly below the includes:
+
+```cpp
+// ====== LOG FLAGS ======
+#define LOG_[MODULE]_INIT   1
+#define LOG_[MODULE]_EVENT  1
+#define LOG_[MODULE]_ERROR  0
+```
 
 ---
 
-## Timings and constants
+## 4. Module Descriptions
 
-CW transceiver
-- DEBOUNCE_TIME = 25 ms  
-- SHORT_PRESS = 150 ms (≤ ⇒ dot)  
-- LONG_PRESS = 400 ms (long press threshold; used ×5 in code to toggle mode)  
-- LETTER_GAP = 800 ms (end of letter detection)  
-- INACTIVITY_TIMEOUT = 5000 ms
+### 4.1 main.cpp
 
-Blinker
-- DOT_TIME = 300 ms  
-- DASH_TIME = 600 ms  
-- SYMBOL_GAP = 300 ms  
-- LETTER_GAP = 600 ms  
-- WORD_GAP = 1800 ms
+* Integrates all modules.
+* `setup()`: initializes History, Translator, Telecom, Network, Telegrapher, Display, Buzzer, and Blinker.
+* `loop()`: calls each module’s `update()`.
+* Manages callbacks and event flow.
 
-Network
-- SCAN_INTERVAL = 500 ms  
-- SCAN_TIMEOUT = 5000 ms  
-- CONNECT_TIMEOUT = 5000 ms  
-- HEARTBEAT_INTERVAL = 1000 ms  
-- HEARTBEAT_TIMEOUT = 3000 ms  
-- RETRY backoff initial = 10000 ms (increases on failures)
+### 4.2 morse-key
 
-Recommendation: align blinker DOT/DASH values with SHORT_PRESS/LONG_PRESS for consistent audio/visual feedback.
+* Captures physical button events (pin D5).
+* Uses ISR + debounce.
+* Sends events to the Telegrapher.
+* Flags: `LOG_MORSE_KEY_ISR`, `LOG_MORSE_KEY_EVENT`.
 
----
+### 4.3 telegrapher
 
-## Module APIs and behavior
+* Classifies durations into dot/dash.
+* Converts Morse sequences into characters.
+* Modes: DIDACTIC / MORSE.
+* Updates History; notifies Display; sends events via Network-State.
+* Flags: `LOG_TELEGRAPHER_SYMBOL`, `LOG_TELEGRAPHER_MODE`.
 
-### cw-transceiver
-Public functions
-- initCWTransceiver()  
-- updateCWTransceiver()  
-- captureInput(InputSource source, unsigned long duration)  
-- getConnectionState() → FREE | TX | RX  
-- getMode() → DIDACTIC | MORSE  
-- getCurrentSymbol(), getHistoryTX(), getHistoryRX()
+### 4.4 morse-telecom
 
-Behavior summary
-- Reads LOCAL (D5) and REMOTE (D6) with INPUT_PULLUP; applies debounce.
-- Activates buzzer (D8) while a key is pressed.
-- Classifies press duration into dot ('.') or dash ('-') using SHORT_PRESS threshold.
-- If LOCAL press starts and occupyNetwork() returns true, sets state to TX and calls sendDuration(duration).
-- For REMOTE durations (received via network), sets state to RX and populates currentSymbol accordingly.
-- After LETTER_GAP without presses, translateMorse() maps symbol to a character and appends to TX or RX history (30-char circular buffer behavior).
+* Text-based TCP protocol (port 5000).
+* Messages: `alive`, `duration:<ms>`, `request_tx`, `ok`, `busy`, `mac:<mac>`.
+* Flags: `LOG_TELECOM_RX`, `LOG_TELECOM_TX`.
 
-Notes
-- currentSymbol supports up to 6 elements per letter; adjust buffer if needed.
-- translateMorse() returns '\0' for unknown codes — you may want a visible fallback like '?'.
+### 4.5 network-state
 
-### network
-Public functions
-- initNetwork()  
-- updateNetwork()  
-- occupyNetwork() — currently returns isConnected()  
-- isConnected()  
-- sendDuration(unsigned long duration)  
-- getNetworkStrength() → "###%" or " OFF"
+* Manages FREE/TX/RX states.
+* Controls Display and Buzzer.
+* Flags: `LOG_NETSTATE_CHANGE`, `LOG_NETSTATE_TIMEOUT`.
 
-Behavior summary
-- FSM states: SCANNING → CONNECTING → CONNECTED / AP_MODE / DISCONNECTED.
-- Performs async Wi‑Fi scan to find SSID "morse-transceiver". If none found after attempts, starts softAP (AP+STA).
-- Establishes TCP connection on port 5000; protocol: plain text messages terminated by '\n'.
-- Heartbeat: sends "alive" every 1s; heartbeat timeout 3s → disconnect.
-- Handles messages:
-  - "alive" → heartbeat update
-  - "duration:<ms>" → captureInput(REMOTE, ms)
-  - "request_tx" → replies "ok" or "busy" based on connection state
-  - "mac:<mac>" → role negotiation by MAC comparison (determine who should be STA vs AP)
+### 4.6 network-connect
 
-Notes and improvements
-- occupyNetwork() returns true only when connected (or AP_MODE with client). If team wants an explicit reservation/handshake, extend protocol (request_tx negotiation).
-- Consider adding authentication or configurable SSID/password.
+* Performs network scan, connection, and heartbeat.
+* Provides socket to Telecom.
+* Flags: `LOG_NETCONNECT_SCAN`, `LOG_NETCONNECT_CONN`.
 
-### blinker
-Public functions
-- initBlinker()  
-- setBlinkerMessage(const char* newMessage)  
-- updateBlinker()
+### 4.7 history
 
-Behavior summary
-- Converts ASCII message to Morse using PROGMEM table and constructs morseMessage string using '.' '-' '/' (letter separator) and ' ' (word separator).
-- Blinks LED (D4) according to DOT_TIME/DASH_TIME and gaps.
-- Buffer morseMessage fixed at 100 bytes — messages longer than that are truncated.
+* Circular buffer for TX/RX (30 chars).
+* Display shows 29 visible characters:
 
-Notes
-- Check strcpy_P usage to avoid buffer overflow on systems with long Morse codes; increase buffer if you plan long messages.
+  * Line 1: 10 chars
+  * Line 2: 10 chars
+  * Line 3: 9 chars
+* Flags: `LOG_HISTORY_PUSH`, `LOG_HISTORY_OVERFLOW`.
 
-### display
-Public functions
-- initDisplay() — initializes SSD1306, shows splash bitmap, prepares UI
-- updateDisplay() — refreshes UI (throttled to 100 ms internally; project calls every 500 ms)
+### 4.8 display-adapter
 
-Behavior summary
-- Uses Adafruit_SSD1306 (128×64, I2C address 0x3C). Wire.begin(D2, D1) used for SDA/SCL.
-- Shows splash bitmap on startup for DISPLAY_INIT_DURATION (3s) then clears and enters main UI.
-- Main UI layout:
-  - Vertical divider at x = 64 (left: history; right: symbol/letter)
-  - Top-right: connection indicator (TX upper / RX lower)
-  - Top-right corner: Wi‑Fi strength (cached string, 4 chars)
-  - Left-top: TX history (3 lines, 10 chars each)
-  - Left-bottom: RX history (3 lines, 10 chars each)
-  - Right: big symbol/letter area (textSize 6)
-  - DIDACTIC mode: shows translated letter briefly and blinking cursor when idle
-  - MORSE mode: shows current symbol as composed; shows last letter briefly after entry
-- Display code caches previous values (history, symbol, state, mode, network strength) and skips redraws unless content changed.
-- Network strength updated every NETWORK_UPDATE_INTERVAL (5s) via getNetworkStrength().
+* Renders the OLED layout.
+* Left half: TX/RX history.
+* Right half: current symbol or letter (1.5s).
+* Wi-Fi indicator shown in top-right corner.
+* Blinking cursor in DIDACTIC mode.
+* Flags: `LOG_DISPLAY_UPDATE`, `LOG_DISPLAY_CACHE`.
 
-Notes
-- initDisplay() blocks for 3s to show the splash; async network scan continues in background.
-- If using a different OLED library or address, update display.cpp accordingly.
+### 4.9 buzzer-driver
+
+* Non-blocking sound patterns.
+* Used by Telegrapher and Network-State.
+* Flags: `LOG_BUZZER_INIT`, `LOG_BUZZER_PATTERN`.
+
+### 4.10 blinker
+
+* Phrase → Morse → LED blinking loop.
+* Fully independent.
+* Flags: `LOG_BLINKER_INIT`, `LOG_BLINKER_BUILD`, `LOG_BLINKER_RUN`, `LOG_BLINKER_PHASE`.
+
+### 4.11 translator
+
+* ASCII ↔ Morse lookup.
+* Flags: `LOG_TRANSLATOR_LOOKUP`.
+
+### 4.12 bitmap.h
+
+* Bitmap in PROGMEM.
+* Displayed during the 3-second splash screen.
 
 ---
 
-## Build, flash and recommended workflow
+## 5. Best Practices
 
-Recommended environments
-- PlatformIO (VS Code) — preferred for CI and reproducible builds
-- Arduino IDE — simpler for quick testing
-
-Dependencies
-- ESP8266 core (ESP8266WiFi family)  
-- Adafruit_GFX and Adafruit_SSD1306 for the display (or alternate SSD1306 driver if preferred)
-
-Build/flash steps (PlatformIO)
-1. Place all source files under `firmware/` or `/src`.  
-2. Create `platformio.ini` for your board (e.g., Wemos D1 mini or NodeMCU).  
-3. `pio run -t upload` to compile and flash.  
-4. Open Serial Monitor at 115200 to follow logs.
-
-Build/flash steps (Arduino IDE)
-1. Copy files into a single sketch folder (`morse-project.ino` + .cpp/.h).  
-2. Select board and COM port.  
-3. Compile and upload.  
-4. Monitor serial at 115200.
-
-CI/Release suggestions
-- Use GitHub Actions + PlatformIO for automated build on PRs and to produce firmware artifacts (.bin) on tags/releases.
-- Publish binaries via GitHub Releases and tag using semantic versioning (vMAJOR.MINOR.PATCH).
+* Always use `millis()` + `yield()`.
+* Timestamped logs.
+* Boundary checks for all buffers.
+* Use callbacks for loose coupling.
+* Constants in CAPS.
+* Splash screen fixed at 3 seconds.
+* History must always reflect 29 visible characters.
 
 ---
 
-## Tests and troubleshooting checklist
+## 6. Interaction Flow
 
-Startup checks
-- Serial logs show network scan, display init, CW transceiver init and blinker message.
+### Local input (morse-key)
 
-Local input
-- Press and hold local button (D5): buzzer should be ON; release logs Duration and symbol.
-- Confirm short vs long mapping: ≤150 ms => dot, >150 ms => dash.
+Button → Telegrapher → History → Display → Buzzer → Network-State → Telecom.
 
-Letter detection
-- After no key activity for LETTER_GAP (800 ms), currentSymbol should be translated and appended to history.
+### Remote input
 
-Network pairing
-- Two units with same firmware should discover and negotiate via SSID `morse-transceiver`.
-- Confirm TCP connect and exchange of `mac:` and `alive` messages; durations sent should appear on peer as remote symbols.
+TCP → Network-Connect → Telecom → Telegrapher → History → Display → Buzzer.
 
-Display issues
-- If OLED stays blank: check I2C wiring (SDA/SCL), address 0x3C, and Adafruit_SSD1306 library configuration.
+### Blinker
 
-Common fixes
-- Wi‑Fi never connects / stays in AP: examine serial scan logs; adjust SSID/PASS or enable a known AP for testing.
-- Buzzer silent: use transistor driver and check wiring/polarity.
-- Spurious button events: increase DEBOUNCE_TIME or add hardware RC filter.
+Independent system; LED blinks the configured phrase.
+
+### Display
+
+Reads History; shows current symbol/letter; TX/RX/Free states; Wi-Fi indicator.
+
+### Buzzer
+
+Provides both local and remote feedback.
 
 ---
 
-## Limitations and recommended improvements
+## 7. Testing and Troubleshooting
 
-- Security: SSID is open by default (PASS empty). Make SSID and PASS configurable and optionally add simple authentication.
-- Backoff logic: reset retryDelay on success and cap max backoff to avoid unbounded growth.
-- Logging: add log levels (DEBUG/INFO/WARN) to reduce Serial spam in production and to speed real-time behavior.
-- Protocol robustness: validate and clamp received `duration` values; handle partial lines and malformed packets more defensively.
-- UI/feedback: unify DOT/DASH timings between blinker and input thresholds for consistent user experience.
-- History handling: consider exposing history over the network or adding a serial/HTTP status endpoint for remote monitoring.
+* Splash screen: must last 3 seconds.
+* Button test: press → buzzer ON; release → duration logged.
+* Classification thresholds: ≤150ms = dot, >150ms = dash.
+* Translation: 800ms of silence triggers letter conversion.
+* Networking: communication between devices must be stable.
+* Display: verify history, symbol output, and Wi-Fi indicator.
+
+**Common issues:**
+
+* Blank OLED → verify SDA/SCL.
+* Wi-Fi stuck in AP mode → check SSID.
+* No buzzer sound → inspect transistor.
+* Poor debounce → adjust `DEBOUNCE_TIME`.
 
 ---
 
-## License and credits
+## 8. Advanced Recommendations
 
-- Add an explicit LICENSE file (e.g., MIT) before public distribution.  
-- Credit dependencies (Adafruit GFX / SSD1306 / ESP8266 core) in docs.
+* Configurable SSID and password.
+* Log levels: DEBUG/INFO/WARN/ERROR.
+* TCP packet validation.
+* Synchronize blinker timings with thresholds.
+* Export history over the network.
+* Maintain strict module isolation.
 
 ---
+
+## 9. License and Credits
+
+* License: MIT.
+* Credits: Adafruit GFX / SSD1306, ESP8266 core.
+* Author: Allan.
+
+---
+
+## 10. Conclusion
+
+This document defines the technical structure, architecture, interaction flows, display layout, and best practices for maintaining and evolving the Morse transceiver firmware.

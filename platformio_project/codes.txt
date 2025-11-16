@@ -1,0 +1,2756 @@
+﻿Generated on: 2025-11-15T18:19:46.6911374-03:00
+----- FILE: src\main.cpp -----
+// File:        main.cpp
+// Project:     Morse Transceiver
+// Description: IntegraÃ§Ã£o principal do projeto Morse transceiver (PlatformIO friendly, sem .ino).
+//              Faz o wiring dos mÃ³dulos morse-key, telegrapher, morse-telecom, network-state,
+//              history, display-adapter, buzzer-driver e translator.
+//              Loop principal nÃ£o bloqueante chamando cada mÃ³dulo.
+//
+// Author:      Allan <allan@email.com>
+// Created:     2025-11-15
+// Modified:    2025-11-15
+//
+// License:     MIT License
+//              Copyright (c) 2025 Allan
+//              Permission is hereby granted, free of charge, to any person obtaining a copy
+//              of this software and associated documentation files (the "Software"), to deal
+//              in the Software without restriction, including without limitation the rights
+//              to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+//              copies of the Software, subject to the conditions in the full license.
+//
+// Notes:
+//  - Este arquivo Ã© o ponto de entrada do projeto.
+//  - Depende de todos os mÃ³dulos auxiliares (history, network-state, display-adapter, etc).
+//  - Loop principal Ã© cooperativo e non-blocking.
+//
+// Change Log:
+//  2025-11-15  Allan    CriaÃ§Ã£o inicial do arquivo main.cpp
+//  2025-11-15  Allan    CorreÃ§Ãµes de nomes de inicializaÃ§Ã£o/atualizaÃ§Ã£o de network
+//  2025-11-15  Allan    Atualizado para integrar o mÃ³dulo blinker (init + update) e iniciar frase de boot
+//
+
+#include <Arduino.h>
+#include "morse-key.h"
+#include "telegrapher.h"
+#include "morse-telecom.h"
+#include "network-state.h"
+#include "history.h"
+#include "display-adapter.h"
+#include "buzzer-driver.h"
+#include "translator.h"
+#include "network-connect.h" // para init/updateNetworkConnect
+#include "blinker.h"        // novo: mÃ³dulo blinker
+
+// Configuration
+#define KEY_PIN        2
+#define BUZZER_PIN     12
+
+// Forward local callbacks (thin adapters)
+static void onTelegrapherLocalSymbol(char sym, unsigned long dur_ms) {
+  // push to history and request network send via network-state / morse-telecom
+  history_pushTXSymbol(sym);
+  // Request network-state to handle transmission; network-state should call morse_telecom_sendSymbol or enqueue
+  ns_requestLocalSymbol(sym, dur_ms);
+  // Also send via telecom immediately (simple policy)
+  morse_telecom_sendSymbol(sym, dur_ms);
+  // audible click feedback
+  buzzer_driver_playClick();
+}
+
+static void onTelegrapherLocalDown() {
+  history_pushTXSymbol('>'); // marker for down (optional)
+  ns_requestLocalDown();
+  morse_telecom_sendDown();
+  buzzer_driver_playClick();
+}
+
+static void onTelegrapherLocalUp() {
+  ns_requestLocalUp();
+  morse_telecom_sendUp();
+  buzzer_driver_playClick();
+}
+
+static void onTelegrapherModeToggle() {
+  // Let display redraw to show mode
+  displayAdapter_forceRedraw();
+}
+
+static void onTelegrapherRemoteSymbol(char sym, unsigned long dur_ms) {
+  history_pushRXSymbol(sym);
+  ns_notifyRemoteSymbol(sym, dur_ms);
+  // small ack sound for remote symbol
+  buzzer_driver_playAck();
+}
+
+static void onTelegrapherRemoteDown() {
+  ns_notifyRemoteDown();
+  buzzer_driver_onStateChange(RX);
+}
+
+static void onTelegrapherRemoteUp() {
+  ns_notifyRemoteUp();
+  buzzer_driver_onStateChange(FREE);
+}
+
+// Network-state callbacks to UI and buzzer
+static void onNsStateChange(ConnectionState st) {
+  // update display and play sound via buzzer-driver
+  displayAdapter_forceRedraw();
+  buzzer_driver_onStateChange(st);
+}
+
+// morse-telecom incoming wiring -> telegrapher
+static void mt_remoteDown_cb() { telegrapher_handleRemoteDown(); }
+static void mt_remoteUp_cb()   { telegrapher_handleRemoteUp(); }
+static void mt_remoteSymbol_cb(char sym, unsigned long dur_ms) { telegrapher_handleRemoteSymbol(sym, dur_ms); }
+
+// Optional debug callback from morse-key (ISR-safe tiny)
+static void mk_dbg_cb(bool down, unsigned long t_us) {
+  // Keep very small: just a serial dot for debug (avoid heavy work in ISR)
+  (void)down; (void)t_us;
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(50);
+
+  // Init modules (order: low-level first)
+  history_init();
+  translator_init();
+  morse_telecom_init();
+
+  // Network connect and network state initialization (nomes corretos)
+  initNetworkConnect();   // inicializa o gerenciador de conexÃ£o TCP/WiFi
+  initNetworkState();     // inicializa a mÃ¡quina de estado TX/RX/FREE
+
+  telegrapher_init();
+  displayAdapter_init();
+  buzzer_driver_init(BUZZER_PIN);
+
+  // Key init after telegrapher so ISR events are safely queued
+  morse_key_init(KEY_PIN, true);
+  morse_key_setDebugCallback(mk_dbg_cb);
+
+  // Register callbacks
+  telegrapher_onLocalSymbol(onTelegrapherLocalSymbol);
+  telegrapher_onLocalDown(onTelegrapherLocalDown);
+  telegrapher_onLocalUp(onTelegrapherLocalUp);
+  telegrapher_onModeToggle(onTelegrapherModeToggle);
+
+  telegrapher_onRemoteSymbol(onTelegrapherRemoteSymbol);
+  telegrapher_onRemoteDown(onTelegrapherRemoteDown);
+  telegrapher_onRemoteUp(onTelegrapherRemoteUp);
+
+  morse_telecom_onRemoteDown(mt_remoteDown_cb);
+  morse_telecom_onRemoteUp(mt_remoteUp_cb);
+  morse_telecom_onRemoteSymbol(mt_remoteSymbol_cb);
+
+  ns_onStateChange(onNsStateChange);
+
+  // Initial UI splash
+  displayAdapter_showSplash("Morse", "Booting...", 1200);
+
+  // Force first redraw after boot
+  displayAdapter_forceRedraw();
+
+  // Initialize blinker and start with a default phrase looping independently.
+  // Use LED_BUILTIN (pass 255) and start phrase "SEMPRE ALERTA".
+  // If you prefer to initialize without starting the phrase, call initBlinker(255) and later startBlinker("...").
+  initBlinker(255, "SEMPRE ALERTA");
+}
+
+void loop() {
+  // Main cooperative loop
+  // Order chosen to prioritize network processing and UI responsiveness
+  // 1) network I/O (assumes functions exist)
+  updateNetworkConnect();    // process incoming network data, will call morse_telecom_handleIncomingLine when lines arrive
+  morse_telecom_update();    // flush any telecom local queue to network
+  telegrapher_update();      // process key events & remote event forwarding
+  updateNetworkState();      // state machine for TX/RX arbitration, timeouts
+  displayAdapter_update();   // redraw when history or state changed
+  buzzer_driver_update();    // drive buzzer non-blocking
+
+  // Drive blinker (non-blocking, looping playback independent of other modules)
+  updateBlinker();
+
+  // small yield to allow WiFi/OS background tasks on some platforms
+  delay(1);
+}
+
+
+----- FILE: src\bitmap.h -----
+// File: bitmap.h v1.0
+// Description: Morse transceiver module â€” Splash screen bitmap stored in PROGMEM (128x64)
+// Last modification: included placeholder; no change to bit pattern
+// Modified: 2025-11-14 22:09
+// Created: 2025-11-14
+
+#ifndef BITMAP_H
+#define BITMAP_H
+
+// Bitmap PROGMEM para splash screen (128x64)
+static const unsigned char bitmap[] PROGMEM = {
+  /* conteÃºdo binÃ¡rio do splash (mantido igual ao seu) */
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x20, 0x00, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x70, 0x00, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xf8, 0x00, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0xfc, 0x00, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0xfe, 0x00, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0xfe, 0x00, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0xff, 0x00, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x07, 0xff, 0x00, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0x79, 0xfb, 0x8e, 0x7c, 0x7c, 0x7c, 0x00, 0x07, 0xff, 0x00, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0xfd, 0xfb, 0x8e, 0x7e, 0x7e, 0x7c, 0x00, 0x07, 0xff, 0x00, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0xcd, 0x83, 0xce, 0x66, 0x66, 0x60, 0x00, 0x07, 0xff, 0x00, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0xc1, 0x83, 0xce, 0x66, 0x66, 0x60, 0x07, 0xe3, 0xdf, 0x1f, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0xf1, 0xf3, 0x5a, 0x66, 0x66, 0x7c, 0x0f, 0xf3, 0xde, 0x7f, 0x80, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0x39, 0xf3, 0x5a, 0x7e, 0x7e, 0x7c, 0x1f, 0xfb, 0xde, 0xff, 0xc0, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0x1d, 0x83, 0x7a, 0x78, 0x6c, 0x60, 0x1d, 0xf9, 0xde, 0xfd, 0xc0, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0x0d, 0x83, 0x72, 0x60, 0x6c, 0x60, 0x19, 0xfd, 0xdd, 0xfc, 0xe0, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0xdd, 0xf3, 0x32, 0x60, 0x66, 0x7c, 0x1f, 0xfd, 0xdd, 0xff, 0xe0, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0xf9, 0xfb, 0x32, 0x60, 0x66, 0x7c, 0x1f, 0xfe, 0xdf, 0xff, 0xc0, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x1f, 0x0e, 0xdb, 0x87, 0xc0, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0f, 0x06, 0xdb, 0x83, 0xc0, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x06, 0x06, 0xdb, 0x03, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0f, 0xff, 0x80, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x70, 0x00, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0x0e, 0x18, 0x3e, 0x7e, 0x7e, 0x70, 0x00, 0x02, 0xdb, 0x00, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0x0e, 0x18, 0x3e, 0x6e, 0x7e, 0x70, 0x00, 0x06, 0xdb, 0x00, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0x0f, 0x18, 0x30, 0x66, 0x18, 0x70, 0x00, 0x0e, 0xdb, 0x80, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0x0b, 0x18, 0x30, 0x66, 0x18, 0xd8, 0x00, 0x3d, 0xfd, 0xe0, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0x1b, 0x18, 0x3e, 0x6e, 0x18, 0xd8, 0x00, 0x1d, 0xfc, 0xe0, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0x19, 0x98, 0x3c, 0x7c, 0x18, 0xd8, 0x00, 0x01, 0xfe, 0x00, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0x1f, 0x98, 0x30, 0x6c, 0x18, 0xf8, 0x00, 0x01, 0xfc, 0x00, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0x1f, 0x98, 0x30, 0x6c, 0x19, 0xfc, 0x00, 0x00, 0xf8, 0x00, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0x31, 0x9f, 0x3e, 0x66, 0x19, 0x8c, 0x00, 0x00, 0x70, 0x00, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0x30, 0xdf, 0xbe, 0x66, 0x19, 0x8c, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0xce, 0x00, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x72, 0x00, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0xfe, 0x00, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0x06, 0x00, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x06, 0x03, 0x00, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0c, 0x01, 0x80, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+};
+
+#endif
+
+
+----- FILE: src\blinker.cpp -----
+// File: blinker.cpp v1.3
+// Description: Non-blocking Morse LED blinker implementation using translator (looping, isolated)
+// Last modification: isolated playback; translator used only during build phase; structured logs
+// Modified: 2025-11-15 05:30
+// Created: 2025-11-15
+
+#include "blinker.h"
+#include "translator.h"
+#include <string.h>
+#include <stdarg.h>
+
+// ====== LOG FLAGS ======
+// Set 0 to disable, 1 to enable
+#define LOG_BLINKER_INIT    1   // log initialization and initial phrase
+#define LOG_BLINKER_BUILD   1   // log translation/build (ASCII -> morse buffer)
+#define LOG_BLINKER_RUN     1   // log start/stop events
+#define LOG_BLINKER_PHASE   1   // log phase transitions (dot/dash/gaps/loop)
+#define LOG_BLINKER_VERBOSE 0   // extra verbose debug (rarely used)
+
+// ====== LOG HELPERS ======
+static void blog_init(const char* fmt, ...) {
+#if LOG_BLINKER_INIT
+  va_list ap; va_start(ap, fmt); vprintf(fmt, ap); va_end(ap); Serial.println();
+#else
+  (void)fmt;
+#endif
+}
+static void blog_build(const char* fmt, ...) {
+#if LOG_BLINKER_BUILD
+  va_list ap; va_start(ap, fmt); vprintf(fmt, ap); va_end(ap); Serial.println();
+#else
+  (void)fmt;
+#endif
+}
+static void blog_run(const char* fmt, ...) {
+#if LOG_BLINKER_RUN
+  va_list ap; va_start(ap, fmt); vprintf(fmt, ap); va_end(ap); Serial.println();
+#else
+  (void)fmt;
+#endif
+}
+static void blog_phase(const char* fmt, ...) {
+#if LOG_BLINKER_PHASE
+  va_list ap; va_start(ap, fmt); vprintf(fmt, ap); va_end(ap); Serial.println();
+#else
+  (void)fmt;
+#endif
+}
+static void blog_v(const char* fmt, ...) {
+#if LOG_BLINKER_VERBOSE
+  va_list ap; va_start(ap, fmt); vprintf(fmt, ap); va_end(ap); Serial.println();
+#else
+  (void)fmt;
+#endif
+}
+
+// ====== CONFIG ======
+static uint8_t BLINKER_LED_PIN = LED_BUILTIN;
+
+// Timings (ms) - original readable values
+static const unsigned long DOT_TIME   = 300;
+static const unsigned long DASH_TIME  = 600;
+static const unsigned long GAP_SYMBOL = 300;
+static const unsigned long GAP_LETTER = 600;
+static const unsigned long GAP_WORD   = 1800;
+
+// Internal morse buffer format:
+// letters separated by single space, words separated by "/ " (slash + space)
+static char morseBuffer[512];
+static size_t morseLength = 0u;
+
+// Playback state (internal only)
+static size_t playPos = 0u;
+static bool phaseOn = false;             // LED is ON (dot/dash) or OFF (gaps)
+static unsigned long phaseUntil = 0u;
+static bool running = false;
+
+// ====== HELPERS ======
+static inline bool timeNotReached(unsigned long now, unsigned long until) {
+  return (long)(now - until) < 0;
+}
+
+static void safeAppend(const char* s) {
+  if (!s || !*s) return;
+  size_t cur = strlen(morseBuffer);
+  size_t add = strlen(s);
+  if (cur + add + 1 >= sizeof(morseBuffer)) {
+    size_t room = sizeof(morseBuffer) - 1 - cur;
+    if (room > 0) {
+      strncat(morseBuffer, s, room);
+      morseBuffer[sizeof(morseBuffer) - 1] = '\0';
+    }
+  } else {
+    strcat(morseBuffer, s);
+  }
+}
+
+// Build morseBuffer once using translator; no side effects with other modules.
+static void buildMorseFromPhrase(const char* phrase) {
+  morseBuffer[0] = '\0';
+  if (!phrase) {
+    morseLength = 0;
+    blog_build("%lu - blinker build: empty phrase", millis());
+    return;
+  }
+
+  char morseToken[32];
+  for (size_t i = 0; phrase[i] != '\0'; ++i) {
+    char c = phrase[i];
+    if (c == ' ') {
+      safeAppend("/ ");
+      continue;
+    }
+    if (!translator_charToMorse(c, morseToken, sizeof(morseToken))) {
+      blog_build("%lu - blinker build: unknown char '%c' skipped", millis(), c);
+      continue;
+    }
+    safeAppend(morseToken);
+    safeAppend(" "); // letter separator
+  }
+  morseLength = strlen(morseBuffer);
+  blog_build("%lu - blinker built morse (len=%u): %s", millis(), (unsigned)morseLength, morseBuffer);
+}
+
+// ====== PUBLIC API ======
+void initBlinker(uint8_t ledPin, const char* initialPhrase) {
+  if (ledPin != 255) BLINKER_LED_PIN = ledPin;
+  pinMode(BLINKER_LED_PIN, OUTPUT);
+  digitalWrite(BLINKER_LED_PIN, LOW);
+
+  // translator used only to build morse sequence (no runtime interaction)
+  translator_init();
+
+  morseBuffer[0] = '\0';
+  morseLength = 0;
+  running = false;
+  playPos = 0;
+  phaseOn = false;
+  phaseUntil = 0;
+
+  blog_init("%lu - blinker init on pin %u", millis(), (unsigned)BLINKER_LED_PIN);
+
+  if (initialPhrase && initialPhrase[0] != '\0') {
+    buildMorseFromPhrase(initialPhrase);
+    blog_init("%lu - blinker initial phrase set: \"%s\" -> morseLen=%u", millis(), initialPhrase, (unsigned)morseLength);
+    if (morseLength > 0) {
+      running = true;
+      playPos = 0;
+      phaseOn = false;
+      phaseUntil = 0;
+    }
+  }
+}
+
+void startBlinker(const char* phrase) {
+  if (!phrase || phrase[0] == '\0') {
+    blog_run("%lu - blinker start called with empty phrase - ignored", millis());
+    return;
+  }
+  buildMorseFromPhrase(phrase);
+  if (morseLength == 0) {
+    blog_run("%lu - blinker start: morseLength==0 for phrase \"%s\"", millis(), phrase);
+    return;
+  }
+  running = true;
+  playPos = 0;
+  phaseOn = false;
+  phaseUntil = 0;
+  digitalWrite(BLINKER_LED_PIN, LOW);
+  blog_run("%lu - blinker started phrase: \"%s\"", millis(), phrase);
+}
+
+void stopBlinker() {
+  running = false;
+  morseBuffer[0] = '\0';
+  morseLength = 0;
+  playPos = 0;
+  phaseOn = false;
+  phaseUntil = 0;
+  digitalWrite(BLINKER_LED_PIN, LOW);
+  blog_run("%lu - blinker stopped", millis());
+}
+
+void updateBlinker() {
+  if (!running || morseLength == 0) return;
+  unsigned long now = millis();
+
+  // if inside a timed phase and not yet reached, return
+  if (phaseUntil != 0 && timeNotReached(now, phaseUntil)) return;
+
+  // just finished an ON phase (dot or dash)
+  if (phaseOn) {
+    phaseOn = false;
+    digitalWrite(BLINKER_LED_PIN, LOW);
+    phaseUntil = now + GAP_SYMBOL;
+    blog_phase("%lu - blinker ON->OFF, symbol gap %lu ms", millis(), (unsigned long)GAP_SYMBOL);
+    return;
+  }
+
+  // OFF phase finished or starting fresh: advance to next symbol
+  if (playPos >= morseLength) {
+    // reached end -> loop with end-of-word gap
+    playPos = 0;
+    phaseUntil = now + GAP_WORD;
+    digitalWrite(BLINKER_LED_PIN, LOW);
+    blog_phase("%lu - blinker sequence end -> loop gap %lu ms", millis(), (unsigned long)GAP_WORD);
+    return;
+  }
+
+  // read next char and advance safely
+  char c = morseBuffer[playPos++];
+  if (c == ' ') {
+    // letter gap
+    phaseUntil = now + GAP_LETTER;
+    digitalWrite(BLINKER_LED_PIN, LOW);
+    blog_phase("%lu - blinker letter gap %lu ms", millis(), (unsigned long)GAP_LETTER);
+    return;
+  }
+  if (c == '/') {
+    // word gap marker
+    phaseUntil = now + GAP_WORD;
+    digitalWrite(BLINKER_LED_PIN, LOW);
+    blog_phase("%lu - blinker word gap %lu ms", millis(), (unsigned long)GAP_WORD);
+    // skip following space if present (we produced "/ ")
+    if (playPos < morseLength && morseBuffer[playPos] == ' ') ++playPos;
+    return;
+  }
+  if (c == '.') {
+    digitalWrite(BLINKER_LED_PIN, HIGH);
+    phaseOn = true;
+    phaseUntil = now + DOT_TIME;
+    blog_phase("%lu - blinker DOT at bufPos=%u dur=%lu ms", millis(), (unsigned)(playPos - 1), (unsigned long)DOT_TIME);
+    return;
+  }
+  if (c == '-') {
+    digitalWrite(BLINKER_LED_PIN, HIGH);
+    phaseOn = true;
+    phaseUntil = now + DASH_TIME;
+    blog_phase("%lu - blinker DASH at bufPos=%u dur=%lu ms", millis(), (unsigned)(playPos - 1), (unsigned long)DASH_TIME);
+    return;
+  }
+
+  // unknown char -> continue immediately
+  blog_v("%lu - blinker unknown char '%c' at pos %u - skipping", millis(), c, (unsigned)(playPos - 1));
+  phaseUntil = now;
+}
+
+
+----- FILE: src\blinker.h -----
+// File: blinker.h v1.3
+// Description: Non-blocking Morse LED blinker API using translator (looping, isolated)
+// Last modification: API stable; isolated playback (no side effects)
+// Modified: 2025-11-15 05:30
+// Created: 2025-11-15
+
+#ifndef BLINKER_H
+#define BLINKER_H
+
+#include <Arduino.h>
+
+// Initialize blinker module.
+// ledPin: Arduino digital pin to use for LED; pass 255 to use LED_BUILTIN.
+// initialPhrase: optional C-string; if non-null the blinker will build and start looping it.
+void initBlinker(uint8_t ledPin = 255, const char* initialPhrase = nullptr);
+
+// Build and start blinking a phrase (letters, digits, spaces). Replaces previous phrase and starts looping.
+// This only builds an internal morse sequence (via translator) and starts playback.
+// It does NOT interact with history, network, buzzer, or other modules.
+void startBlinker(const char* phrase);
+
+// Stop blinking immediately and clear phrase.
+void stopBlinker();
+
+// Non-blocking update; call frequently from main loop to drive playback.
+void updateBlinker();
+
+#endif // BLINKER_H
+
+
+----- FILE: src\buzzer-driver.cpp -----
+// File: buzzer-driver.cpp v1.0
+// Description: Non-blocking buzzer driver (beeps, patterns, tone) for Morse project
+// Last modification: tone control, pattern playback and state-change hooks
+// Modified: 2025-11-15 03:36
+// Created: 2025-11-15
+
+#include "buzzer-driver.h"
+#include <Arduino.h>
+
+#ifndef LOG_BUZZER_DRIVER
+  #define LOG_BUZZER_DRIVER 0
+#endif
+
+static uint8_t bd_pin = 0;
+static bool bd_enabled = false;
+
+// Single-beep state
+static bool bd_playing = false;
+static unsigned long bd_playUntil = 0;
+static unsigned int bd_playFreq = 1000;
+
+// Pattern state
+static const unsigned long* bd_pat_ptr = nullptr;
+static size_t bd_pat_len = 0;
+static size_t bd_pat_idx = 0;
+static unsigned long bd_pat_until = 0;
+static bool bd_pat_loop = false;
+static unsigned int bd_pat_freq = 1000;
+static bool bd_pat_phase_on = true; // true = ON phase, false = OFF phase
+
+static void bd_log(const char* fmt, ...) {
+#if LOG_BUZZER_DRIVER
+  va_list ap; va_start(ap, fmt);
+  vprintf(fmt, ap);
+  va_end(ap);
+  Serial.println();
+#endif
+}
+
+static inline void bd_startTone(unsigned int freq) {
+  if (!bd_enabled) return;
+#if defined(ARDUINO)
+  // tone/noTone are widely available on Arduino cores; call them
+  tone(bd_pin, freq);
+#else
+  // fallback: toggle pin with PWM is platform-specific; still attempt tone if present
+  tone(bd_pin, freq);
+#endif
+  bd_log("buzzer-driver: startTone %uHz", freq);
+}
+
+static inline void bd_stopTone() {
+  if (!bd_enabled) return;
+  noTone(bd_pin);
+  bd_log("buzzer-driver: stopTone");
+}
+
+void buzzer_driver_init(uint8_t pin) {
+  bd_pin = pin;
+  if (bd_pin == 0) {
+    bd_enabled = false;
+    return;
+  }
+  pinMode(bd_pin, OUTPUT);
+  digitalWrite(bd_pin, LOW);
+  bd_enabled = true;
+
+  // clear states
+  bd_playing = false;
+  bd_playUntil = 0;
+  bd_pat_ptr = nullptr;
+  bd_pat_len = 0;
+  bd_pat_idx = 0;
+  bd_pat_until = 0;
+  bd_pat_loop = false;
+  bd_pat_freq = 1000;
+  bd_pat_phase_on = true;
+
+  bd_log("%lu - buzzer-driver initialized on pin %u", millis(), bd_pin);
+}
+
+void buzzer_driver_update() {
+  if (!bd_enabled) return;
+  unsigned long now = millis();
+
+  // Single beep has priority
+  if (bd_playing) {
+    if (now >= bd_playUntil) {
+      bd_stopTone();
+      bd_playing = false;
+      bd_playUntil = 0;
+      bd_log("%lu - buzzer-driver beep finished", now);
+    }
+    return;
+  }
+
+  // Pattern playback
+  if (bd_pat_ptr && bd_pat_len > 0) {
+    if (now >= bd_pat_until) {
+      // Advance to next index
+      bd_pat_idx++;
+      if (bd_pat_idx >= bd_pat_len) {
+        if (bd_pat_loop) {
+          bd_pat_idx = 0;
+        } else {
+          // Finished pattern
+          bd_pat_ptr = nullptr;
+          bd_pat_len = 0;
+          bd_pat_idx = 0;
+          bd_pat_phase_on = true;
+          bd_stopTone();
+          bd_log("%lu - buzzer-driver pattern finished", now);
+          return;
+        }
+      }
+
+      unsigned long dur = bd_pat_ptr[bd_pat_idx];
+      bd_pat_phase_on = ((bd_pat_idx & 1) == 0); // even => ON, odd => OFF
+      if (bd_pat_phase_on) bd_startTone(bd_pat_freq);
+      else bd_stopTone();
+
+      // Guard: zero durations become immediate transitions
+      bd_pat_until = now + dur;
+      bd_log("%lu - buzzer-driver pattern idx=%u phase_on=%d dur=%lu", now, (unsigned)bd_pat_idx, (int)bd_pat_phase_on, dur);
+    }
+  }
+}
+
+void buzzer_driver_beep(unsigned long duration_ms, unsigned int freq_hz) {
+  if (!bd_enabled || duration_ms == 0) return;
+  // abort any pattern
+  bd_pat_ptr = nullptr;
+  bd_pat_len = 0;
+  bd_pat_idx = 0;
+  // start single tone
+  bd_playFreq = freq_hz;
+  bd_startTone(bd_playFreq);
+  bd_playUntil = millis() + duration_ms;
+  bd_playing = true;
+  bd_log("%lu - buzzer-driver beep start dur=%lu freq=%u", millis(), duration_ms, freq_hz);
+}
+
+void buzzer_driver_toneOn(unsigned int freq_hz) {
+  if (!bd_enabled) return;
+  // abort others
+  bd_playing = false;
+  bd_pat_ptr = nullptr;
+  bd_pat_len = 0;
+  bd_pat_idx = 0;
+  bd_playUntil = 0;
+  bd_startTone(freq_hz);
+}
+
+void buzzer_driver_toneOff() {
+  if (!bd_enabled) return;
+  bd_playing = false;
+  bd_pat_ptr = nullptr;
+  bd_pat_len = 0;
+  bd_pat_idx = 0;
+  bd_playUntil = 0;
+  bd_stopTone();
+}
+
+void buzzer_driver_playPattern(const unsigned long* pattern, size_t patternLen, bool loopPattern, unsigned int freq_hz) {
+  if (!bd_enabled || !pattern || patternLen == 0) return;
+  // stop single beep
+  bd_playing = false;
+  bd_playUntil = 0;
+  // set pattern state
+  bd_pat_ptr = pattern;
+  bd_pat_len = patternLen;
+  bd_pat_idx = 0;
+  bd_pat_loop = loopPattern;
+  bd_pat_freq = freq_hz;
+  // start first phase immediately
+  unsigned long now = millis();
+  unsigned long firstDur = bd_pat_ptr[0];
+  bd_pat_phase_on = true;
+  if (firstDur > 0) {
+    bd_startTone(bd_pat_freq);
+    bd_pat_until = now + firstDur;
+  } else {
+    bd_pat_until = now;
+  }
+  bd_log("%lu - buzzer-driver pattern start freq=%u len=%u firstDur=%lu", now, bd_pat_freq, (unsigned)bd_pat_len, firstDur);
+}
+
+void buzzer_driver_playClick() {
+  buzzer_driver_beep(50, 2000);
+}
+
+void buzzer_driver_playAck() {
+  buzzer_driver_beep(150, 1500);
+}
+
+void buzzer_driver_onStateChange(ConnectionState state) {
+  if (!bd_enabled) return;
+  switch (state) {
+    case TX:
+      // short click to acknowledge local TX
+      buzzer_driver_playClick();
+      break;
+    case RX:
+      // different tone for RX
+      buzzer_driver_playAck();
+      break;
+    case FREE:
+    default:
+      // no sound for FREE
+      break;
+  }
+}
+
+----- FILE: src\buzzer-driver.h -----
+// File: buzzer-driver.h v1.0
+// Description: Non-blocking buzzer driver for Morse project (beeps/patterns/tone)
+// Last modification: standardized API, added state-change reaction helper
+// Modified: 2025-11-15 03:32
+// Created: 2025-11-15
+
+#ifndef BUZZER_DRIVER_H
+#define BUZZER_DRIVER_H
+
+#include <Arduino.h>
+#include "network-state.h"
+
+// Initialize buzzer on pin (use 0 to disable)
+void buzzer_driver_init(uint8_t pin);
+
+// Call frequently from loop()
+void buzzer_driver_update();
+
+// Simple actions (non-blocking)
+void buzzer_driver_beep(unsigned long duration_ms, unsigned int freq_hz = 1000); // single beep
+void buzzer_driver_toneOn(unsigned int freq_hz = 1000);                           // start continuous tone
+void buzzer_driver_toneOff();                                                     // stop tone
+
+// Patterns: array of on/off durations (ms). patternLen is number of entries.
+// pattern example: {100, 50, 100} -> beep 100ms, silence 50ms, beep 100ms
+// If loopPattern is true the pattern repeats.
+void buzzer_driver_playPattern(const unsigned long* pattern, size_t patternLen, bool loopPattern = false, unsigned int freq_hz = 1000);
+
+// Convenience: play a short click (used on local press) and longer ack (remote)
+void buzzer_driver_playClick();  // short click ~50ms
+void buzzer_driver_playAck();    // ack ~150ms
+
+// React to state change (network-state)
+void buzzer_driver_onStateChange(ConnectionState state);
+
+#endif // BUZZER_DRIVER_H
+
+----- FILE: src\display-adapter.cpp -----
+// File: display-adapter.cpp
+// ImplementaÃ§Ã£o do adaptador de display (layout TX/RX + splash bitmap)
+// Ãšltimas alteraÃ§Ãµes: restauraÃ§Ã£o da estrutura original da tela e integraÃ§Ã£o com history/network-state
+// Ãšltima modificaÃ§Ã£o: 2025-11-15
+// Criado em: 2025-11-15
+
+#include "display-adapter.h"
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include "bitmap.h"        // splash bitmap in PROGMEM
+#include "history.h"
+#include "network-state.h"
+
+#ifndef SCREEN_WIDTH
+  #define SCREEN_WIDTH 128
+#endif
+#ifndef SCREEN_HEIGHT
+  #define SCREEN_HEIGHT 64
+#endif
+#ifndef SSD1306_RESET
+  #define SSD1306_RESET -1
+#endif
+
+static Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, SSD1306_RESET);
+
+static unsigned long lastUpdateMs = 0;
+static const unsigned long UPDATE_INTERVAL_MS = 100;
+static bool needFullRedraw = false;
+
+// Splash management
+static bool splashActive = false;
+static unsigned long splashUntilMs = 0;
+static char splashLine1[DISPLAY_ADAPTER_LINE_BUF];
+static char splashLine2[DISPLAY_ADAPTER_LINE_BUF];
+
+// Optional redraw callback
+static da_redraw_cb_t redrawCb = nullptr;
+
+// Local buffers for snapshot
+static char txTop[DISPLAY_ADAPTER_LINE_BUF];
+static char txMid[DISPLAY_ADAPTER_LINE_BUF];
+static char txBot[DISPLAY_ADAPTER_LINE_BUF];
+static char rxTop[DISPLAY_ADAPTER_LINE_BUF];
+static char rxMid[DISPLAY_ADAPTER_LINE_BUF];
+static char rxBot[DISPLAY_ADAPTER_LINE_BUF];
+
+static unsigned long lastHistoryVersion = 0;
+static ConnectionState lastState = FREE;
+
+// Status/status bar helper (bottom)
+static void drawStatusBar(ConnectionState st) {
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0, SCREEN_HEIGHT - 10);
+  const char* stateStr = (st == TX) ? "TX" : (st == RX) ? "RX" : "FREE";
+  char buf[32];
+  unsigned long lastAct = ns_lastActivityMs();
+  unsigned long age = (millis() > lastAct) ? (millis() - lastAct) : 0;
+  snprintf(buf, sizeof(buf), "[%s] %s", stateStr, (age < 2000) ? "*" : " ");
+  display.print(buf);
+}
+
+// Full redraw keeping original layout: left top TX (3 lines), left bottom RX (3 lines), right large char/state
+static void doFullRedraw(ConnectionState st) {
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+
+  // separators like original: vertical midline and horizontal middle in left half
+  display.drawFastVLine(64, 0, 64, SSD1306_WHITE);
+  display.drawFastHLine(0, 32, 64, SSD1306_WHITE);
+
+  // TX top-left (3 lines)
+  display.setTextSize(1);
+  display.setCursor(2, 2);  display.print(txTop);
+  display.setCursor(2, 12); display.print(txMid);
+  display.setCursor(2, 22); display.print(txBot);
+
+  // RX bottom-left (3 lines)
+  display.setCursor(2, 34); display.print(rxTop);
+  display.setCursor(2, 44); display.print(rxMid);
+  display.setCursor(2, 54); display.print(rxBot);
+
+  // State indicator right column
+  display.setTextSize(1);
+  if (st == TX) {
+    display.setCursor(68, 2); display.print("TX");
+  } else if (st == RX) {
+    display.setCursor(68, 54); display.print("RX");
+  }
+
+  // Network strength on top-right if network module provides string via extern
+  extern const char* getNetworkStrength();
+  const char* s = nullptr;
+  // Guard: call only if symbol is linked
+  if ((void*)getNetworkStrength != nullptr) {
+    s = getNetworkStrength();
+  }
+  if (s && *s) {
+    display.setCursor(104, 2);
+    display.print(s);
+  }
+
+  // Large right area: reserved for big char or symbol if needed by higher layers.
+  display.setTextSize(6);
+  // (No default big char here; content is provided via history or other module.)
+
+  // status bottom
+  display.setTextSize(1);
+  drawStatusBar(st);
+
+  display.display();
+}
+
+// Public API
+void displayAdapter_init() {
+  Wire.begin();
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    Serial.println("Display init failed; falling back to Serial output");
+  } else {
+    // show splash immediately from bitmap
+    display.clearDisplay();
+    display.drawBitmap(0, 0, bitmap, SCREEN_WIDTH, SCREEN_HEIGHT, SSD1306_WHITE);
+    display.display();
+  }
+
+  lastHistoryVersion = 0;
+  lastState = FREE;
+  needFullRedraw = true;
+  splashActive = false;
+  splashUntilMs = 0;
+  splashLine1[0] = splashLine2[0] = '\0';
+  txTop[0] = txMid[0] = txBot[0] = '\0';
+  rxTop[0] = rxMid[0] = rxBot[0] = '\0';
+  Serial.printf("%lu - display-adapter initialized\n", millis());
+}
+
+void displayAdapter_showSplash(const char* line1, const char* line2, unsigned long duration_ms) {
+  if (line1) strncpy(splashLine1, line1, sizeof(splashLine1)-1); else splashLine1[0] = '\0';
+  if (line2) strncpy(splashLine2, line2, sizeof(splashLine2)-1); else splashLine2[0] = '\0';
+  splashLine1[sizeof(splashLine1)-1] = '\0';
+  splashLine2[sizeof(splashLine2)-1] = '\0';
+  splashUntilMs = millis() + duration_ms;
+  splashActive = true;
+  needFullRedraw = true;
+}
+
+void displayAdapter_forceRedraw() {
+  needFullRedraw = true;
+  lastHistoryVersion = 0; // force snapshot re-read
+}
+
+void displayAdapter_setRedrawCallback(da_redraw_cb_t cb) {
+  redrawCb = cb;
+}
+
+void displayAdapter_update() {
+  unsigned long now = millis();
+  if (now - lastUpdateMs < UPDATE_INTERVAL_MS) return;
+  lastUpdateMs = now;
+
+  // If splash active, keep bitmap on screen until timeout (bitmap splash preserved)
+  if (splashActive) {
+    if (now < splashUntilMs) {
+      // If display available, bitmap already shown in init; for Serial fallback:
+      if (display.width() <= 0) {
+        Serial.printf("%lu - SPLASH: %s / %s\n", millis(), splashLine1, splashLine2);
+      }
+      return;
+    } else {
+      // expire splash and force redraw
+      splashActive = false;
+      needFullRedraw = true;
+    }
+  }
+
+  // Snapshot history and state
+  unsigned long v = history_getSnapshot(txTop, txMid, txBot, rxTop, rxMid, rxBot, sizeof(txTop));
+  ConnectionState st = ns_getState();
+
+  if (v != lastHistoryVersion || st != lastState || needFullRedraw) {
+    lastHistoryVersion = v;
+    lastState = st;
+    needFullRedraw = false;
+
+    if (redrawCb) redrawCb();
+
+    if (display.width() > 0) {
+      doFullRedraw(st);
+    } else {
+      // Serial fallback
+      Serial.printf("DISPLAY REDRAW state=%s v=%lu\n", (st==TX)?"TX":(st==RX)?"RX":"FREE", v);
+      Serial.printf("TX> %s\n   %s\n   %s\n", txTop, txMid, txBot);
+      Serial.printf("RX> %s\n   %s\n   %s\n", rxTop, rxMid, rxBot);
+    }
+  }
+}
+
+
+----- FILE: src\display-adapter.h -----
+// File: display-adapter.h v1.0
+// Description: Adapter between history/network-state and physical display (SSD1306)
+// Last modification: consistent types, minimal dependencies, redraw callback
+// Modified: 2025-11-15 03:32
+// Created: 2025-11-15
+
+#ifndef DISPLAY_ADAPTER_H
+#define DISPLAY_ADAPTER_H
+
+#include <Arduino.h>
+#include "history.h"
+#include "network-state.h"
+
+// Initialize the display adapter
+void displayAdapter_init();
+
+// Non-blocking periodic update; call frequently from loop()
+void displayAdapter_update();
+
+// Force a full redraw on next update
+void displayAdapter_forceRedraw();
+
+// Splash management (non-blocking)
+void displayAdapter_showSplash(const char* line1, const char* line2, unsigned long duration_ms);
+
+// Optional: register callback when redraw happens
+typedef void (*da_redraw_cb_t)(void);
+void displayAdapter_setRedrawCallback(da_redraw_cb_t cb);
+
+// Buffer sizes expected by adapter
+#define DISPLAY_ADAPTER_LINE_BUF 32
+#define DISPLAY_ADAPTER_ROWS 3
+
+#endif // DISPLAY_ADAPTER_H
+
+----- FILE: src\history.cpp -----
+// File: history.cpp v1.0
+// Description: TX/RX history storage with versioning and atomic-ish snapshot
+// Last modification: buffer handling, line rotation and snapshot copying
+// Modified: 2025-11-15 03:36
+// Created: 2025-11-15
+
+#include "history.h"
+#include <string.h>
+
+#ifndef LOG_HISTORY
+  #define LOG_HISTORY 0
+#endif
+
+// Configuration: characters per line (must fit display)
+static const size_t LINE_LEN = 32; // max chars per stored line (including NUL)
+static const int LINES_N = 3;      // number of lines per direction
+
+// Internal storage
+static char txLines[LINES_N][LINE_LEN];
+static char rxLines[LINES_N][LINE_LEN];
+
+// Current lengths (number of characters currently in each line, excluding NUL)
+static size_t txLen[LINES_N];
+static size_t rxLen[LINES_N];
+
+// Rolling pointers: which line is "top" (0 = top-most recent)
+static int txTopIdx = 0;
+static int rxTopIdx = 0;
+
+// Version counter (volatile because updated from different contexts)
+static volatile unsigned long version = 1; // increment on changes
+
+// Helpers
+static inline void h_initLines() {
+  for (int i = 0; i < LINES_N; ++i) {
+    txLines[i][0] = '\0';
+    rxLines[i][0] = '\0';
+    txLen[i] = 0;
+    rxLen[i] = 0;
+  }
+  txTopIdx = 0;
+  rxTopIdx = 0;
+  version = 1;
+}
+
+static inline void bumpVersion() {
+  version++;
+  if (version == 0) version = 1;
+}
+
+// Append a single character to a fixed-size line buffer with simple left-shift on overflow.
+// buf: destination buffer (size LINE_LEN), len: current length (by-ref), ch: char to append
+static void pushCharToLine(char buf[LINE_LEN], size_t &len, char ch) {
+  if (!buf) return;
+  // If there is room for one more char + NUL
+  if (len + 1 < LINE_LEN) {
+    buf[len] = ch;
+    len++;
+    buf[len] = '\0';
+    return;
+  }
+  // No room: drop the oldest char (shift left by one) and append at end-1
+  memmove(buf, buf + 1, LINE_LEN - 2);        // preserve up to LINE_LEN-2 chars
+  buf[LINE_LEN - 2] = ch;
+  buf[LINE_LEN - 1] = '\0';
+  len = LINE_LEN - 2 + 1; // chars stored including the new one
+}
+
+// Push a symbol ('.' or '-') into the current top line
+static void pushSymbolToTop(char lines[LINES_N][LINE_LEN], size_t lens[LINES_N], int &topIdx, char sym) {
+  pushCharToLine(lines[topIdx], lens[topIdx], sym);
+}
+
+// Start a new line entry for a letter: advance top index and append the letter as first char
+static void pushLetterAsNewEntry(char lines[LINES_N][LINE_LEN], size_t lens[LINES_N], int &topIdx, char letter) {
+  topIdx = (topIdx + 1) % LINES_N;
+  lens[topIdx] = 0;
+  lines[topIdx][0] = '\0';
+  pushCharToLine(lines[topIdx], lens[topIdx], letter);
+}
+
+// Public API
+
+void history_init() {
+  h_initLines();
+#if LOG_HISTORY
+  Serial.printf("%lu - history initialized\n", millis());
+#endif
+}
+
+void history_pushTXSymbol(char sym) {
+  if (!(sym == '.' || sym == '-')) return;
+  pushSymbolToTop(txLines, txLen, txTopIdx, sym);
+  bumpVersion();
+}
+
+void history_pushRXSymbol(char sym) {
+  if (!(sym == '.' || sym == '-')) return;
+  pushSymbolToTop(rxLines, rxLen, rxTopIdx, sym);
+  bumpVersion();
+}
+
+void history_pushTXLetter(char c) {
+  if (c == '\0') return;
+  pushLetterAsNewEntry(txLines, txLen, txTopIdx, c);
+  bumpVersion();
+}
+
+void history_pushRXLetter(char c) {
+  if (c == '\0') return;
+  pushLetterAsNewEntry(rxLines, rxLen, rxTopIdx, c);
+  bumpVersion();
+}
+
+// snapshot helpers
+static void copyLogicalLine(char dest[], size_t destLen, char srcLines[LINES_N][LINE_LEN], int topIdx, int logicalIdx) {
+  if (!dest || destLen == 0) return;
+  int idx = (topIdx + logicalIdx) % LINES_N;
+  if (idx < 0) idx += LINES_N;
+  // safe copy
+  strncpy(dest, srcLines[idx], destLen - 1);
+  dest[destLen - 1] = '\0';
+}
+
+unsigned long history_getSnapshot(char* outTxTop, char* outTxMid, char* outTxBot,
+                                  char* outRxTop, char* outRxMid, char* outRxBot,
+                                  size_t bufLen) {
+  if (bufLen == 0) return version;
+  noInterrupts();
+  unsigned long v = version;
+  // copy TX
+  copyLogicalLine(outTxTop, bufLen, txLines, txTopIdx, 0);
+  copyLogicalLine(outTxMid, bufLen, txLines, txTopIdx, 1);
+  copyLogicalLine(outTxBot, bufLen, txLines, txTopIdx, 2);
+  // copy RX
+  copyLogicalLine(outRxTop, bufLen, rxLines, rxTopIdx, 0);
+  copyLogicalLine(outRxMid, bufLen, rxLines, rxTopIdx, 1);
+  copyLogicalLine(outRxBot, bufLen, rxLines, rxTopIdx, 2);
+  interrupts();
+  return v;
+}
+
+unsigned long history_getVersion() {
+  return version;
+}
+
+void history_getTXLine(int index, char* outBuf, size_t bufLen) {
+  if (!outBuf || bufLen == 0) return;
+  if (index < 0 || index >= LINES_N) { outBuf[0] = '\0'; return; }
+  noInterrupts();
+  int idx = (txTopIdx + index) % LINES_N;
+  if (idx < 0) idx += LINES_N;
+  strncpy(outBuf, txLines[idx], bufLen - 1);
+  outBuf[bufLen - 1] = '\0';
+  interrupts();
+}
+
+void history_getRXLine(int index, char* outBuf, size_t bufLen) {
+  if (!outBuf || bufLen == 0) return;
+  if (index < 0 || index >= LINES_N) { outBuf[0] = '\0'; return; }
+  noInterrupts();
+  int idx = (rxTopIdx + index) % LINES_N;
+  if (idx < 0) idx += LINES_N;
+  strncpy(outBuf, rxLines[idx], bufLen - 1);
+  outBuf[bufLen - 1] = '\0';
+  interrupts();
+}
+
+----- FILE: src\history.h -----
+// File: history.h v1.0
+// Description: History store for TX/RX (letters and symbol traces) with versioning
+// Last modification: atomic snapshot and safe buffer handling
+// Modified: 2025-11-15 03:32
+// Created: 2025-11-15
+
+#ifndef HISTORY_H
+#define HISTORY_H
+
+#include <Arduino.h>
+
+// Initialize history module
+void history_init();
+
+// Push events (called by telegrapher / network-state)
+// Letters are single ASCII characters (A-Z, 0-9, punctuation)
+// Symbols are '.' or '-' and stored as part of current running line
+void history_pushTXLetter(char c);
+void history_pushRXLetter(char c);
+void history_pushTXSymbol(char sym); // '.' or '-'
+void history_pushRXSymbol(char sym);
+
+// Query snapshot (atomic-ish): copy current TX/RX visible lines into provided buffers.
+// Buffers must be preallocated by caller.
+// - outTxTop/outTxMid/outTxBot: target buffers for three TX rows (each must hold at least bufLen chars).
+// - outRxTop/outRxMid/outRxBot: target buffers for three RX rows.
+// - bufLen: length of each provided buffer (same for all).
+// Returns current history version after copy.
+unsigned long history_getSnapshot(char* outTxTop, char* outTxMid, char* outTxBot,
+                                  char* outRxTop, char* outRxMid, char* outRxBot,
+                                  size_t bufLen);
+
+// Convenience getters (atomic-ish)
+unsigned long history_getVersion();
+void history_getTXLine(int index, char* outBuf, size_t bufLen); // index 0..2 top..bot
+void history_getRXLine(int index, char* outBuf, size_t bufLen); // index 0..2 top..bot
+
+#endif // HISTORY_H
+
+----- FILE: src\morse-key.cpp -----
+// File: morse-key.cpp v1.0
+// Description: Straight key driver with ISR edge capture and micros debounce
+// Last modification: ISR-safe event forwarding and enable/disable control
+// Modified: 2025-11-15 03:36
+// Created: 2025-11-15
+
+#include "morse-key.h"
+#include "telegrapher.h" // telegrapher_pushKeyEvent(...)
+#include <Arduino.h>
+
+// LOG flag
+#ifndef LOG_MK
+  #define LOG_MK 1
+#endif
+
+static uint8_t key_pin = 0xFF;
+static bool key_enabled = false;
+static bool use_pullup = true;
+
+// ISR debounce (microseconds)
+static const unsigned long ISR_DEBOUNCE_US = 10000UL; // 10 ms
+volatile static unsigned long last_isr_us = 0;
+
+// optional debug callback (must be very fast)
+static mk_dbg_cb_t dbg_cb = nullptr;
+
+static inline void mk_log(const char* fmt, ...) {
+#if LOG_MK
+  va_list ap;
+  va_start(ap, fmt);
+  vprintf(fmt, ap);
+  va_end(ap);
+  Serial.println();
+#endif
+}
+
+// ISR: captures edge timestamps and forwards a TG_KeyEvent to telegrapher
+static void IRAM_ATTR mk_isr_handler() {
+  unsigned long now_us = micros();
+  // simple ISR debounce
+  if ((now_us - last_isr_us) < ISR_DEBOUNCE_US) {
+    last_isr_us = now_us;
+    return;
+  }
+  last_isr_us = now_us;
+
+  int state = digitalRead(key_pin); // LOW = pressed for typical straight key wiring with pullup
+  bool down = (state == LOW);
+
+  // Build TG_KeyEvent and forward to telegrapher (telegrapher_pushKeyEvent is ISR-safe)
+  TG_KeyEvent ev;
+  ev.down = down;
+  ev.t_us = now_us;
+
+  // Forward
+  telegrapher_pushKeyEvent(&ev);
+
+  // Optional lightweight debug callback
+  if (dbg_cb) dbg_cb(down, now_us);
+}
+
+// Public API
+void morse_key_init(uint8_t pin, bool pullup) {
+  key_pin = pin;
+  use_pullup = pullup;
+  if (use_pullup) pinMode(key_pin, INPUT_PULLUP);
+  else pinMode(key_pin, INPUT);
+  // attachInterrupt must be done after pinMode
+#if defined(ARDUINO_ARCH_ESP8266) || defined(ESP8266)
+  attachInterrupt(digitalPinToInterrupt(key_pin), mk_isr_handler, CHANGE);
+#else
+  attachInterrupt(digitalPinToInterrupt(key_pin), mk_isr_handler, CHANGE);
+#endif
+  key_enabled = true;
+  last_isr_us = micros();
+  mk_log("%lu - morse-key initialized on pin %d", millis(), key_pin);
+}
+
+void morse_key_setEnabled(bool enabled) {
+  if (!key_enabled && enabled) {
+    // reattach
+#if defined(ARDUINO_ARCH_ESP8266) || defined(ESP8266)
+    attachInterrupt(digitalPinToInterrupt(key_pin), mk_isr_handler, CHANGE);
+#else
+    attachInterrupt(digitalPinToInterrupt(key_pin), mk_isr_handler, CHANGE);
+#endif
+    key_enabled = true;
+    mk_log("%lu - morse-key enabled", millis());
+  } else if (key_enabled && !enabled) {
+    detachInterrupt(digitalPinToInterrupt(key_pin));
+    key_enabled = false;
+    mk_log("%lu - morse-key disabled", millis());
+  }
+}
+
+void morse_key_setDebugCallback(mk_dbg_cb_t cb) {
+  dbg_cb = cb;
+}
+
+----- FILE: src\morse-key.h -----
+// File: morse-key.h v1.0
+// Description: Hardware straight key driver with ISR edge capture and micros debounce
+// Last modification: added enable/disable ISR and lightweight debug callback
+// Modified: 2025-11-15 03:32
+// Created: 2025-11-15
+
+#ifndef MORSE_KEY_H
+#define MORSE_KEY_H
+
+#include <Arduino.h>
+
+// Initialize the key hardware driver
+// pin: Arduino digital pin number for the key (active LOW expected)
+// pullup: if true enable INPUT_PULLUP, otherwise INPUT
+void morse_key_init(uint8_t pin, bool pullup = true);
+
+// Enable or disable the key ISR (useful for tests or power saving)
+void morse_key_setEnabled(bool enabled);
+
+// Optional: register a diagnostics callback (called from ISR context so must be very fast)
+// The callback receives (down, t_us). Keep it short.
+typedef void (*mk_dbg_cb_t)(bool down, unsigned long t_us);
+void morse_key_setDebugCallback(mk_dbg_cb_t cb);
+
+#endif
+
+----- FILE: src\morse-telecom.cpp -----
+// File: morse-telecom.cpp v1.0
+// Description: Lightweight framing/parser; send helpers and remote event callbacks
+// Last modification: local queue, RX parser and integration with network-connect
+// Modified: 2025-11-15 03:36
+// Created: 2025-11-15
+
+#include "morse-telecom.h"
+#include "network-connect.h" // nc_enqueueOutgoing(...)
+#include <Arduino.h>
+#include <string.h>
+
+// LOG FLAGS (set to 1 as requested)
+#define LOG_TELECOM 1
+#define LOG_TELECOM_RX 1
+#define LOG_TELECOM_TX 1
+
+static mt_remote_down_cb_t cb_remote_down = nullptr;
+static mt_remote_up_cb_t cb_remote_up = nullptr;
+static mt_remote_symbol_cb_t cb_remote_symbol = nullptr;
+
+// small local send queue (optional extra buffering before handing to network-connect)
+// In typical use we call nc_enqueueOutgoing immediately, but keep a tiny local queue for resilience.
+#define MT_LOCAL_Q_SZ 8
+struct MTLocalQ { char line[64]; unsigned long ts; };
+static MTLocalQ localQ[MT_LOCAL_Q_SZ];
+static int lqHead = 0;
+static int lqTail = 0;
+static int lqCount = 0;
+
+static void logf(bool flag, const char* fmt, ...) {
+  if (!flag) return;
+  va_list ap; va_start(ap, fmt);
+  vprintf(fmt, ap);
+  va_end(ap);
+  Serial.println();
+}
+
+static void localq_push(const char* line) {
+  if (!line || !*line) return;
+  unsigned long now = millis();
+  if (lqCount >= MT_LOCAL_Q_SZ) {
+    // drop oldest
+    lqHead = (lqHead + 1) % MT_LOCAL_Q_SZ;
+    lqCount--;
+  }
+  strncpy(localQ[lqTail].line, line, sizeof(localQ[lqTail].line) - 1);
+  localQ[lqTail].line[sizeof(localQ[lqTail].line) - 1] = '\0';
+  localQ[lqTail].ts = now;
+  lqTail = (lqTail + 1) % MT_LOCAL_Q_SZ;
+  lqCount++;
+  logf(LOG_TELECOM_TX, "%lu - telecom localQ enq: %s (q=%d)", now, line, lqCount);
+}
+
+static bool localq_flush_one() {
+  if (lqCount == 0) return true;
+  // try to push to network-connect immediately
+  nc_enqueueOutgoing(localQ[lqHead].line);
+  logf(LOG_TELECOM_TX, "%lu - telecom flush -> nc_enqueue: %s", millis(), localQ[lqHead].line);
+  lqHead = (lqHead + 1) % MT_LOCAL_Q_SZ;
+  lqCount--;
+  return true;
+}
+
+void morse_telecom_init() {
+  lqHead = lqTail = lqCount = 0;
+  cb_remote_down = nullptr;
+  cb_remote_up = nullptr;
+  cb_remote_symbol = nullptr;
+  Serial.printf("%lu - morse-telecom initialized\n", millis());
+}
+
+void morse_telecom_update() {
+  // flush one local queued item per update to avoid bursts
+  if (lqCount > 0) localq_flush_one();
+}
+
+// Sending helpers
+void morse_telecom_sendDown() {
+  // format: DOWN
+  const char* ln = "DOWN";
+  // first try to send directly via network-connect
+  nc_enqueueOutgoing(ln);
+  logf(LOG_TELECOM_TX, "%lu - telecom sendDown queued: %s", millis(), ln);
+}
+
+void morse_telecom_sendUp() {
+  const char* ln = "UP";
+  nc_enqueueOutgoing(ln);
+  logf(LOG_TELECOM_TX, "%lu - telecom sendUp queued: %s", millis(), ln);
+}
+
+void morse_telecom_sendSymbol(char sym, unsigned long dur_ms) {
+  // validate symbol
+  if (sym != '.' && sym != '-') return;
+  char buf[64];
+  snprintf(buf, sizeof(buf), "sym:%c;dur:%lu", sym, dur_ms);
+  // push locally then to network
+  // prefer direct enqueue, but push into local queue if needed
+  nc_enqueueOutgoing(buf);
+  logf(LOG_TELECOM_TX, "%lu - telecom sendSymbol queued: %s", millis(), buf);
+}
+
+// Incoming line handler â€” to be called by network-connect when a line arrives.
+// Lightweight parser: recognizes alive/alive_ack, DOWN/UP, sym: and r_sym:
+void morse_telecom_handleIncomingLine(const char* line) {
+  if (!line) return;
+  if (line[0] == '\0') return;
+
+  logf(LOG_TELECOM_RX, "%lu - telecom RX: %s", millis(), line);
+
+  if (strcmp(line, "alive") == 0) {
+    // network-connect handles heartbeat reply; no-op here
+    return;
+  }
+  if (strcmp(line, "alive_ack") == 0) {
+    return;
+  }
+  if (strcmp(line, "DOWN") == 0) {
+    if (cb_remote_down) cb_remote_down();
+    return;
+  }
+  if (strcmp(line, "UP") == 0) {
+    if (cb_remote_up) cb_remote_up();
+    return;
+  }
+  // parse sym: or r_sym:
+  if (strncmp(line, "sym:", 4) == 0 || strncmp(line, "r_sym:", 6) == 0) {
+    // find symbol and dur
+    const char* p = strchr(line, ':');
+    if (!p) return;
+    p++; // after colon
+    char sym = p[0];
+    const char* durp = strstr(line, "dur:");
+    unsigned long dur = 0;
+    if (durp) {
+      durp += 4;
+      dur = strtoul(durp, NULL, 10);
+    }
+    if (cb_remote_symbol) cb_remote_symbol(sym, dur);
+    return;
+  }
+
+  // unknown message: ignore or log
+  logf(LOG_TELECOM_RX, "%lu - telecom RX unknown: %s", millis(), line);
+}
+
+// Callbacks registration
+void morse_telecom_onRemoteDown(mt_remote_down_cb_t cb) { cb_remote_down = cb; }
+void morse_telecom_onRemoteUp(mt_remote_up_cb_t cb) { cb_remote_up = cb; }
+void morse_telecom_onRemoteSymbol(mt_remote_symbol_cb_t cb) { cb_remote_symbol = cb; }
+
+----- FILE: src\morse-telecom.h -----
+// File: morse-telecom.h v1.0
+// Description: Morse telecom framing â€” send helpers and remote event callbacks
+// Last modification: local queue and lightweight parser for incoming lines
+// Modified: 2025-11-15 03:32
+// Created: 2025-11-15
+
+#ifndef MORSE_TELECOM_H
+#define MORSE_TELECOM_H
+
+#include <Arduino.h>
+
+// callbacks for remote events
+typedef void (*mt_remote_down_cb_t)(void);
+typedef void (*mt_remote_up_cb_t)(void);
+typedef void (*mt_remote_symbol_cb_t)(char sym, unsigned long dur_ms);
+
+// lifecycle
+void morse_telecom_init();
+void morse_telecom_update();
+
+// sending (these enqueue to network via nc_enqueueOutgoing)
+void morse_telecom_sendDown();
+void morse_telecom_sendUp();
+void morse_telecom_sendSymbol(char sym, unsigned long dur_ms);
+
+// incoming line handler (call this from network-connect when a line is received)
+void morse_telecom_handleIncomingLine(const char* line);
+
+// callbacks registration
+void morse_telecom_onRemoteDown(mt_remote_down_cb_t cb);
+void morse_telecom_onRemoteUp(mt_remote_up_cb_t cb);
+void morse_telecom_onRemoteSymbol(mt_remote_symbol_cb_t cb);
+
+#endif
+
+----- FILE: src\network-connect.cpp -----
+// File: network-connect.cpp v1.1
+// Description: Non-blocking WiFi + TCP connector with outgoing queue, heartbeat and RX -> telecom integration
+// Last modification: call morse_telecom_handleIncomingLine on received lines; provide getNetworkStrength()
+// Modified: 2025-11-15
+
+#include "network-connect.h"
+#include <ESP8266WiFi.h>
+#include <ESP8266WiFiMulti.h>
+#include "morse-telecom.h"  // for morse_telecom_handleIncomingLine
+
+#define LOG_INIT     1
+#define LOG_UPDATE   1
+#define LOG_SCAN     1
+#define LOG_CONNECT  1
+#define LOG_AP       1
+#define LOG_RX       1
+#define LOG_TX       1
+#define LOG_STRENGTH 1
+
+// Configuration
+static const char* NC_SSID = "morse-transceiver";
+static const char* NC_PASS = "";
+static const IPAddress AP_IP(192, 168, 4, 1);
+static const uint16_t TCP_PORT = 5000;
+static const unsigned long SCAN_INTERVAL_MS = 800;
+static const unsigned long SCAN_TIMEOUT_MS = 7000;
+static const int MAX_SCAN_ATTEMPTS = 3;
+static const unsigned long CONNECT_RETRY_MS = 4000;
+static const unsigned long CONNECT_WIFI_TIMEOUT_MS = 5000;
+static const unsigned long HEARTBEAT_INTERVAL_MS = 1500;
+static const unsigned long HEARTBEAT_TIMEOUT_MS = 6000;
+
+// Queue for outgoing lines
+#define OUTQ_SIZE 32
+struct OutQ { char line[64]; unsigned long ts; };
+static OutQ outQueue[OUTQ_SIZE];
+static int outHead = 0;
+static int outTail = 0;
+static int outCount = 0;
+
+// WiFi / TCP internals
+static ESP8266WiFiMulti wifiMulti;
+static WiFiServer server(TCP_PORT);
+static WiFiClient client;
+
+static NC_State state = NC_SCANNING;
+static bool actingAsClient = false;
+
+static unsigned long lastScan = 0;
+static int scanAttempts = 0;
+static int lastScanResult = -2;
+
+static unsigned long connectStart = 0;
+static unsigned long lastStatusLog = 0;
+static unsigned long lastHeartbeatSent = 0;
+static unsigned long lastHeartbeatReceived = 0;
+
+// incoming line buffer
+static char rxLineBuf[128];
+static int rxLinePos = 0;
+
+// peer info
+static char peerIPbuf[32] = "";
+
+// callbacks
+static nc_cb_t cb_connected = nullptr;
+static nc_cb_t cb_disconnected = nullptr;
+static nc_cb_ip_t cb_accepted = nullptr;
+
+// helpers
+static void logf(bool flag, const char* fmt, ...) {
+#if defined(ARDUINO)
+  if (!flag) return;
+  va_list ap; va_start(ap, fmt);
+  vprintf(fmt, ap);
+  va_end(ap);
+  Serial.println();
+#endif
+}
+
+static void outq_push(const char* line) {
+  if (!line || !*line) return;
+  unsigned long now = millis();
+  if (outCount >= OUTQ_SIZE) {
+    // drop oldest
+    outHead = (outHead + 1) % OUTQ_SIZE;
+    outCount--;
+  }
+  strncpy(outQueue[outTail].line, line, sizeof(outQueue[outTail].line) - 1);
+  outQueue[outTail].line[sizeof(outQueue[outTail].line) - 1] = '\0';
+  outQueue[outTail].ts = now;
+  outTail = (outTail + 1) % OUTQ_SIZE;
+  outCount++;
+  logf(LOG_TX, "%lu - Enqueued: %s (q=%d)", now, line, outCount);
+}
+
+static bool outq_send_one_if_connected() {
+  if (outCount == 0) return true;
+  if (!(client && client.connected())) return false;
+  const char* ln = outQueue[outHead].line;
+  client.print(ln);
+  client.print("\n");
+  client.flush();
+  logf(LOG_TX, "%lu - Sent queued: %s", millis(), ln);
+  outHead = (outHead + 1) % OUTQ_SIZE;
+  outCount--;
+  return true;
+}
+
+// Public API
+void initNetworkConnect() {
+  Serial.printf("%lu - initNetworkConnect\n", millis());
+  randomSeed(analogRead(A0));
+  WiFi.mode(WIFI_STA);
+  WiFi.setPhyMode(WIFI_PHY_MODE_11G);
+
+  // start async scan
+  WiFi.scanNetworks(true, true);
+  scanAttempts = 1;
+  lastScan = millis();
+  server.begin();
+  state = NC_SCANNING;
+  outHead = outTail = outCount = 0;
+  actingAsClient = false;
+  peerIPbuf[0] = '\0';
+  connectStart = millis();
+  lastHeartbeatSent = lastHeartbeatReceived = millis();
+  lastStatusLog = millis();
+  rxLinePos = 0;
+
+  logf(LOG_INIT, "%lu - network-connect initialized (SCANNING)", millis());
+}
+
+void nc_enqueueOutgoing(const char* line) { outq_push(line); }
+
+bool nc_isConnected() { return (state == NC_CONNECTED); }
+bool nc_isActingClient() { return actingAsClient; }
+const char* nc_getPeerIP() { return peerIPbuf; }
+
+const char* nc_getRole() {
+  if (state == NC_AP_MODE) return "AP";
+  if (state == NC_CONNECTED && actingAsClient) return "CLIENT";
+  if (state == NC_CONNECTED && !actingAsClient) return "PEER";
+  return "NONE";
+}
+
+// Small 4-char strength string: " OFF" when not connected, or " x" with 0..4 bars when connected.
+const char* getNetworkStrength() {
+  static char s[5];
+  if (WiFi.status() == WL_CONNECTED) {
+    int rssi = WiFi.RSSI(); // typical negative dBm
+    int bars = (rssi >= -55) ? 4 :
+               (rssi >= -65) ? 3 :
+               (rssi >= -75) ? 2 :
+               (rssi >= -85) ? 1 : 0;
+    snprintf(s, sizeof(s), " %d", bars);
+  } else {
+    strncpy(s, " OFF", sizeof(s) - 1);
+    s[sizeof(s) - 1] = '\0';
+  }
+  return s;
+}
+
+void nc_onConnected(nc_cb_t cb) { cb_connected = cb; }
+void nc_onDisconnected(nc_cb_t cb) { cb_disconnected = cb; }
+void nc_onAcceptedClient(nc_cb_ip_t cb) { cb_accepted = cb; }
+
+// Internal: process client incoming data into lines and dispatch to morse_telecom
+static void processClientIncoming() {
+  while (client && client.connected() && client.available()) {
+    int c = client.read();
+    if (c <= 0) break;
+
+    if (c == '\n' || rxLinePos >= (int)sizeof(rxLineBuf) - 1) {
+      rxLineBuf[rxLinePos] = '\0';
+      // trim CR
+      if (rxLinePos > 0 && rxLineBuf[rxLinePos - 1] == '\r') rxLineBuf[rxLinePos - 1] = '\0';
+
+      // Log and dispatch
+      logf(LOG_RX, "%lu - RX raw: %s", millis(), rxLineBuf);
+
+      // Heartbeat handling
+      if (strcmp(rxLineBuf, "alive") == 0) {
+        lastHeartbeatReceived = millis();
+        // auto-reply alive_ack if we are server
+        if (!actingAsClient) {
+          client.print("alive_ack\n");
+          client.flush();
+          logf(LOG_TX, "%lu - Sent: alive_ack", millis());
+        }
+      } else if (strcmp(rxLineBuf, "alive_ack") == 0) {
+        lastHeartbeatReceived = millis();
+      } else {
+        // Forward to telecom parser
+        morse_telecom_handleIncomingLine(rxLineBuf);
+      }
+
+      rxLinePos = 0;
+    } else if (c != '\r') {
+      rxLineBuf[rxLinePos++] = (char)c;
+    }
+  }
+}
+
+// Try to accept a new client in AP mode (non-blocking)
+static void tryAcceptClient() {
+  WiFiClient newClient = server.available();
+  if (newClient && !client.connected()) {
+    client = newClient;
+    strncpy(peerIPbuf, client.remoteIP().toString().c_str(), sizeof(peerIPbuf) - 1);
+    peerIPbuf[sizeof(peerIPbuf) - 1] = '\0';
+    actingAsClient = false;
+    lastHeartbeatReceived = lastHeartbeatSent = millis();
+    state = NC_CONNECTED;
+    logf(LOG_AP, "%lu - Accepted TCP client %s", millis(), peerIPbuf);
+    // Immediately flush queue
+    while (outCount > 0) {
+      if (!outq_send_one_if_connected()) break;
+    }
+    if (cb_accepted) cb_accepted(peerIPbuf);
+    if (cb_connected) cb_connected();
+  } else if (newClient) {
+    // refuse extra connection
+    newClient.stop();
+    logf(LOG_AP, "%lu - Refused extra client", millis());
+  }
+}
+
+// Public update: call frequently from main loop
+void updateNetworkConnect() {
+  unsigned long now = millis();
+
+  // Periodic status log
+  if (now - lastStatusLog >= 5000) {
+    logf(LOG_UPDATE, "%lu - WiFi.status=%d state=%d client.connected=%d", now, WiFi.status(), (int)state, client.connected());
+    lastStatusLog = now;
+  }
+
+  switch (state) {
+    case NC_SCANNING: {
+      if (now - lastScan < SCAN_INTERVAL_MS) break;
+      int n = WiFi.scanComplete();
+      if (n != lastScanResult) {
+        lastScanResult = n;
+        logf(LOG_SCAN, "%lu - scanComplete=%d", now, n);
+      }
+
+      if (n == WIFI_SCAN_RUNNING) {
+        if (now - lastScan > SCAN_TIMEOUT_MS) {
+          WiFi.scanDelete();
+          scanAttempts++;
+          logf(LOG_SCAN, "%lu - scan timeout attempts=%d", now, scanAttempts);
+          // restart scan
+          WiFi.scanNetworks(true, true);
+          lastScan = now;
+        }
+      } else if (n >= 0 && scanAttempts <= MAX_SCAN_ATTEMPTS) {
+        bool found = false;
+        int targetCh = 1;
+        for (int i = 0; i < n; ++i) {
+          if (strcmp(WiFi.SSID(i).c_str(), NC_SSID) == 0) {
+            found = true;
+            targetCh = WiFi.channel(i);
+            logf(LOG_SCAN, "%lu - Found SSID ch=%d rssi=%d", now, targetCh, WiFi.RSSI(i));
+            break;
+          }
+        }
+        WiFi.scanDelete();
+        if (found) {
+          WiFi.begin(NC_SSID, NC_PASS, targetCh);
+          state = NC_CONNECTING;
+          connectStart = now;
+          logf(LOG_SCAN, "%lu - Joining SSID on ch=%d", now, targetCh);
+        } else {
+          scanAttempts++;
+          if (scanAttempts > MAX_SCAN_ATTEMPTS) {
+            WiFi.mode(WIFI_AP_STA);
+            int apChannel = 1;
+            WiFi.softAP(NC_SSID, NC_PASS, apChannel);
+            server.begin();
+            state = NC_AP_MODE;
+            logf(LOG_AP, "%lu - Entered AP_MODE ch=%d", now, apChannel);
+          } else {
+            WiFi.scanNetworks(true, true);
+            lastScan = now;
+            logf(LOG_SCAN, "%lu - SSID not found, scanning again attempt=%d", now, scanAttempts);
+          }
+        }
+      } else {
+        WiFi.scanNetworks(true, true);
+        lastScan = now;
+      }
+    } break;
+
+    case NC_CONNECTING: {
+      if (WiFi.status() == WL_CONNECTED) {
+        // protect against connecting to ourselves
+        if (WiFi.localIP() == AP_IP) {
+          state = NC_AP_MODE;
+          logf(LOG_CONNECT, "%lu - local IP equals AP_IP, switching to AP_MODE", now);
+          break;
+        }
+        // try TCP client connect at intervals
+        if (now - connectStart >= CONNECT_RETRY_MS) {
+          if (client.connect(AP_IP, TCP_PORT)) {
+            actingAsClient = true;
+            state = NC_CONNECTED;
+            lastHeartbeatSent = lastHeartbeatReceived = now;
+            strncpy(peerIPbuf, AP_IP.toString().c_str(), sizeof(peerIPbuf) - 1);
+            peerIPbuf[sizeof(peerIPbuf) - 1] = '\0';
+            logf(LOG_CONNECT, "%lu - TCP client connected to %s:%d", now, AP_IP.toString().c_str(), TCP_PORT);
+            // flush queue immediately
+            while (outCount > 0) {
+              if (!outq_send_one_if_connected()) break;
+            }
+            if (cb_connected) cb_connected();
+          } else {
+            connectStart = now;
+            logf(LOG_CONNECT, "%lu - client.connect failed, retrying", now);
+          }
+        }
+      } else if (now - connectStart > CONNECT_WIFI_TIMEOUT_MS) {
+        state = NC_DISCONNECTED;
+        logf(LOG_CONNECT, "%lu - WiFi STA did not complete connect; DISCONNECTED", now);
+        if (cb_disconnected) cb_disconnected();
+      }
+    } break;
+
+    case NC_CONNECTED: {
+      // check health
+      if (!client || !client.connected()) {
+        logf(LOG_UPDATE, "%lu - TCP lost", now);
+        client.stop();
+        if (actingAsClient) {
+          actingAsClient = false;
+          state = NC_CONNECTING;
+          WiFi.reconnect();
+          connectStart = now;
+          logf(LOG_CONNECT, "%lu - actingAsClient lost; will reconnect", now);
+          if (cb_disconnected) cb_disconnected();
+        } else {
+          state = NC_AP_MODE;
+          logf(LOG_AP, "%lu - AP client disconnected; back to AP_MODE", now);
+          if (cb_disconnected) cb_disconnected();
+        }
+        break;
+      }
+
+      // heartbeat send (only acting client sends actively; AP replies on alive)
+      if (actingAsClient && (now - lastHeartbeatSent >= HEARTBEAT_INTERVAL_MS)) {
+        client.print("alive\n");
+        client.flush();
+        lastHeartbeatSent = now;
+        logf(LOG_TX, "%lu - Sent: alive", now);
+      }
+
+      // heartbeat timeout
+      if ((now - lastHeartbeatReceived) >= HEARTBEAT_TIMEOUT_MS) {
+        client.stop();
+        if (actingAsClient) {
+          actingAsClient = false;
+          state = NC_CONNECTING;
+          WiFi.reconnect();
+          connectStart = now;
+          logf(LOG_CONNECT, "%lu - HB timeout; client will reconnect", now);
+          if (cb_disconnected) cb_disconnected();
+        } else {
+          state = NC_AP_MODE;
+          logf(LOG_AP, "%lu - HB timeout in AP_MODE; switching to AP_MODE", now);
+          if (cb_disconnected) cb_disconnected();
+        }
+        break;
+      }
+
+      // flush outgoing
+      while (outCount > 0) {
+        if (!outq_send_one_if_connected()) break;
+      }
+
+      // process incoming (non-blocking)
+      processClientIncoming();
+    } break;
+
+    case NC_AP_MODE: {
+      // accept clients (non-blocking)
+      tryAcceptClient();
+
+      // if connected as server, handle client I/O
+      if (client && client.connected()) {
+        // flush outgoing
+        while (outCount > 0) {
+          if (!outq_send_one_if_connected()) break;
+        }
+        processClientIncoming();
+      }
+
+      // Periodically scan to detect external SSID and possibly switch to client mode
+      if ((millis() - lastScan) > 20000) {
+        int n2 = WiFi.scanNetworks(false, true);
+        bool found = false;
+        int otherCh = 1;
+        if (n2 > 0) {
+          for (int i = 0; i < n2; ++i) {
+            if (strcmp(WiFi.SSID(i).c_str(), NC_SSID) == 0) {
+              found = true;
+              otherCh = WiFi.channel(i);
+              break;
+            }
+          }
+        }
+        WiFi.scanDelete();
+        lastScan = millis();
+        if (found) {
+          WiFi.begin(NC_SSID, NC_PASS, otherCh);
+          state = NC_CONNECTING;
+          connectStart = millis();
+          logf(LOG_AP, "%lu - Detected external SSID; switching to CONNECTING", millis());
+        }
+      }
+    } break;
+
+    case NC_DISCONNECTED: {
+      if (millis() - connectStart > CONNECT_RETRY_MS) {
+        WiFi.begin(NC_SSID, NC_PASS);
+        state = NC_CONNECTING;
+        connectStart = millis();
+        logf(LOG_CONNECT, "%lu - DISCONNECTED -> CONNECTING (retry)", millis());
+      }
+    } break;
+  } // switch
+}
+
+// End of file
+
+
+----- FILE: src\network-connect.h -----
+// File: network-connect.h v1.0
+// Description: Non-blocking WiFi + TCP connector with outgoing queue and callbacks
+// Last modification: role reporting (AP/CLIENT/PEER) and heartbeat support
+// Modified: 2025-11-15 03:32
+// Created: 2025-11-15
+
+#ifndef NETWORK_CONNECT_H
+#define NETWORK_CONNECT_H
+
+#include <Arduino.h>
+
+typedef enum { NC_SCANNING, NC_CONNECTING, NC_CONNECTED, NC_AP_MODE, NC_DISCONNECTED } NC_State;
+
+typedef void (*nc_cb_t)(void);
+typedef void (*nc_cb_ip_t)(const char* ip);
+
+void initNetworkConnect();
+void updateNetworkConnect();
+
+bool nc_isConnected();
+bool nc_isActingClient();
+const char* nc_getPeerIP();
+const char* nc_getRole();
+
+void nc_enqueueOutgoing(const char* line); // queue a line to send when possible
+
+// Callbacks (only one subscriber for each; modules can chain if needed)
+void nc_onConnected(nc_cb_t cb);       // called when link considered ready (after handshake)
+void nc_onDisconnected(nc_cb_t cb);    // called when link lost
+void nc_onAcceptedClient(nc_cb_ip_t cb); // called when server accepted a client (IP provided)
+
+#endif
+
+----- FILE: src\network-state.cpp -----
+// File: network-state.cpp v1.0
+// Description: Link state manager (TX/RX/FREE) coordinating local/remote events
+// Last modification: activity timeouts, priority rules and callback dispatch
+// Modified: 2025-11-15 03:36
+// Created: 2025-11-15
+
+#include "network-state.h"
+#include <Arduino.h>
+
+// LOG FLAGS (all ON as requested)
+#define LOG_STATE_INIT  1
+#define LOG_STATE_UPDATE 1
+#define LOG_STATE_EVENTS 1
+
+// Timers and thresholds (ms)
+static const unsigned long STATE_ACTIVITY_TIMEOUT_MS = 5000; // idle -> FREE
+static const unsigned long STATE_MIN_TX_MS = 40;  // ignore very brief glitches
+static const unsigned long STATE_MIN_RX_MS = 40;
+
+static ConnectionState currentState = FREE;
+static unsigned long lastStateChangeAt = 0;
+static unsigned long lastActivityAt = 0;
+
+// When local requests start/end
+static bool localPressed = false;
+static unsigned long localPressAt = 0;
+
+// When remote requests start/end
+static bool remotePressed = false;
+static unsigned long remotePressAt = 0;
+
+// Callbacks
+static ns_state_cb_t cb_stateChange = nullptr;
+static ns_local_send_cb_t cb_localDown = nullptr;
+static ns_local_send_cb_t cb_localUp = nullptr;
+static ns_local_symbol_cb_t cb_localSymbol = nullptr;
+static ns_remote_symbol_cb_t cb_remoteSymbol = nullptr;
+
+// Helpers
+static void doStateChange(ConnectionState s) {
+  if (s == currentState) return;
+  currentState = s;
+  lastStateChangeAt = millis();
+  lastActivityAt = lastStateChangeAt;
+  if (LOG_STATE_EVENTS) Serial.printf("%lu - STATE -> %s\n", lastStateChangeAt,
+        (s == TX) ? "TX" : (s == RX) ? "RX" : "FREE");
+  if (cb_stateChange) cb_stateChange(s);
+}
+
+// Public API
+void initNetworkState() {
+  currentState = FREE;
+  lastStateChangeAt = lastActivityAt = millis();
+  localPressed = false;
+  remotePressed = false;
+  localPressAt = remotePressAt = 0;
+  cb_stateChange = nullptr;
+  cb_localDown = nullptr;
+  cb_localUp = nullptr;
+  cb_localSymbol = nullptr;
+  cb_remoteSymbol = nullptr;
+  if (LOG_STATE_INIT) Serial.printf("%lu - network-state initialized (FREE)\n", millis());
+}
+
+ConnectionState ns_getState() { return currentState; }
+unsigned long ns_lastActivityMs() { return lastActivityAt; }
+
+void ns_onStateChange(ns_state_cb_t cb) { cb_stateChange = cb; }
+void ns_onLocalSendDown(ns_local_send_cb_t cb) { cb_localDown = cb; }
+void ns_onLocalSendUp(ns_local_send_cb_t cb) { cb_localUp = cb; }
+void ns_onLocalSymbol(ns_local_symbol_cb_t cb) { cb_localSymbol = cb; }
+void ns_onRemoteSymbol(ns_remote_symbol_cb_t cb) { cb_remoteSymbol = cb; }
+
+// Local requests (from CW)
+// ns_requestLocalDown: the user pressed the local key and wants to start TX
+void ns_requestLocalDown() {
+  unsigned long now = millis();
+  if (localPressed) return; // ignore duplicates
+  localPressed = true;
+  localPressAt = now;
+  lastActivityAt = now;
+  // Inform lower layer to emit physical DOWN on network (telecom will implement actual send)
+  if (LOG_STATE_EVENTS) Serial.printf("%lu - local down requested\n", now);
+  if (cb_localDown) cb_localDown();
+  // Change state to TX only if not in RX (remote has priority); if in RX, ignore local TX until free
+  if (currentState != RX) {
+    doStateChange(TX);
+  } else {
+    if (LOG_STATE_EVENTS) Serial.printf("%lu - local down ignored because in RX\n", now);
+  }
+}
+
+// ns_requestLocalUp: the user released the key and wants to stop TX
+void ns_requestLocalUp() {
+  unsigned long now = millis();
+  if (!localPressed) return;
+  localPressed = false;
+  unsigned long dur = now - localPressAt;
+  lastActivityAt = now;
+  if (LOG_STATE_EVENTS) Serial.printf("%lu - local up requested dur=%lu\n", now, dur);
+  if (cb_localUp) cb_localUp();
+  // If we were in TX, transition to FREE (or remain RX if remote pressed meanwhile)
+  if (currentState == TX) {
+    if (remotePressed) {
+      doStateChange(RX);
+    } else {
+      doStateChange(FREE);
+    }
+  }
+}
+
+// called by CW layer to notify a local symbol (dot/dash) â€” will be forwarded via callback
+void ns_requestLocalSymbol(char sym, unsigned long dur_ms) {
+  lastActivityAt = millis();
+  if (LOG_STATE_EVENTS) Serial.printf("%lu - local symbol: %c dur=%lu\n", millis(), sym, dur_ms);
+  if (cb_localSymbol) cb_localSymbol(sym, dur_ms);
+}
+
+// Remote notifications (from telecom)
+// ns_notifyRemoteDown: remote started pressing â€” enter RX state (unless local holds TX)
+void ns_notifyRemoteDown() {
+  unsigned long now = millis();
+  if (remotePressed) return;
+  remotePressed = true;
+  remotePressAt = now;
+  lastActivityAt = now;
+  if (LOG_STATE_EVENTS) Serial.printf("%lu - remote down\n", now);
+  // Remote takes precedence: if we're TX locally, we keep TX; else switch to RX
+  if (currentState != TX) doStateChange(RX);
+}
+
+// ns_notifyRemoteUp: remote released â€” exit RX or maintain TX
+void ns_notifyRemoteUp() {
+  unsigned long now = millis();
+  if (!remotePressed) return;
+  unsigned long dur = now - remotePressAt;
+  remotePressed = false;
+  lastActivityAt = now;
+  if (LOG_STATE_EVENTS) Serial.printf("%lu - remote up dur=%lu\n", now, dur);
+  // If currently RX, move to FREE unless local is pressed (then go to TX)
+  if (currentState == RX) {
+    if (localPressed) doStateChange(TX);
+    else doStateChange(FREE);
+  }
+}
+
+// ns_notifyRemoteSymbol: forward remote symbol to interested party
+void ns_notifyRemoteSymbol(char sym, unsigned long dur_ms) {
+  lastActivityAt = millis();
+  if (LOG_STATE_EVENTS) Serial.printf("%lu - remote symbol: %c dur=%lu\n", millis(), sym, dur_ms);
+  if (cb_remoteSymbol) cb_remoteSymbol(sym, dur_ms);
+}
+
+// Main update loop: handle timeouts and transitions
+void updateNetworkState() {
+  unsigned long now = millis();
+
+  // Activity timeout: if no activity and not pressed by anyone, go FREE
+  if (currentState != FREE && (now - lastActivityAt >= STATE_ACTIVITY_TIMEOUT_MS)) {
+    if (!localPressed && !remotePressed) {
+      if (LOG_STATE_UPDATE) Serial.printf("%lu - activity timeout -> FREE\n", now);
+      doStateChange(FREE);
+    }
+  }
+
+  // Debounce short glitches: if local pressed but duration < min TX, do nothing (handled by CW)
+  // No heavy work here â€” network-state is intentionally lightweight
+}
+
+----- FILE: src\network-state.h -----
+// File: network-state.h v1.0
+// Description: Link state manager (TX/RX/FREE) with local/remote events and callbacks
+// Last modification: added timing constants and query helpers
+// Modified: 2025-11-15 03:32
+// Created: 2025-11-15
+
+#ifndef NETWORK_STATE_H
+#define NETWORK_STATE_H
+
+#include <Arduino.h>
+
+// Shared connection state used across modules (moved here to remove dependency on cw-transceiver.h)
+typedef enum {
+  FREE = 0,
+  TX   = 1,
+  RX   = 2
+} ConnectionState;
+
+// Optional timing constants that some modules expect (override before include if needed)
+#ifndef DOT_MAX
+  #define DOT_MAX        160
+#endif
+#ifndef DASH_MAX
+  #define DASH_MAX       480
+#endif
+#ifndef MODE_HOLD_MS
+  #define MODE_HOLD_MS   1500
+#endif
+#ifndef LONG_PRESS_MS
+  #define LONG_PRESS_MS  2000
+#endif
+#ifndef LETTER_GAP_MS
+  #define LETTER_GAP_MS  360
+#endif
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+typedef void (*ns_state_cb_t)(ConnectionState newState);
+typedef void (*ns_local_send_cb_t)(void);                // request to send DOWN (start) or UP (stop)
+typedef void (*ns_local_symbol_cb_t)(char sym, unsigned long dur_ms); // when local generates a symbol
+typedef void (*ns_remote_symbol_cb_t)(char sym, unsigned long dur_ms); // remote symbol arrived
+
+void initNetworkState();
+void updateNetworkState();
+
+// Called by CW layer when user presses/releases
+void ns_requestLocalDown();         // local key pressed (start TX)
+void ns_requestLocalUp();           // local key released (stop TX)
+void ns_requestLocalSymbol(char sym, unsigned long dur_ms); // local symbol produced (dot/dash)
+
+// Called by telecom/connect module when remote events arrive
+void ns_notifyRemoteDown();         // remote pressed (RX starts)
+void ns_notifyRemoteUp();           // remote released (RX ends)
+void ns_notifyRemoteSymbol(char sym, unsigned long dur_ms); // remote symbol (decoded by telecom)
+
+// Callbacks registration
+void ns_onStateChange(ns_state_cb_t cb);
+void ns_onLocalSendDown(ns_local_send_cb_t cb);
+void ns_onLocalSendUp(ns_local_send_cb_t cb);
+void ns_onLocalSymbol(ns_local_symbol_cb_t cb);
+void ns_onRemoteSymbol(ns_remote_symbol_cb_t cb);
+
+// Query
+ConnectionState ns_getState();
+unsigned long ns_lastActivityMs();
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif // NETWORK_STATE_H
+
+----- FILE: src\telegrapher.cpp -----
+// File: telegrapher.cpp v1.0
+// Description: Non-blocking telegrapher â€” key queue, classification, hold mode, callbacks
+// Last modification: IRQ-safe volatile queue, explicit field copies and gap finalization
+// Modified: 2025-11-15 03:36
+// Created: 2025-11-15
+
+#include "telegrapher.h"
+#include "network-state.h"   // provides MODE_HOLD_MS, LONG_PRESS_MS, LETTER_GAP_MS, DOT_MAX, DASH_MAX
+#include "morse-telecom.h"
+#include <Arduino.h>
+#include <string.h>
+#include <stdarg.h>
+
+// LOG FLAGS
+#ifndef LOG_TG_EVENTS
+  #define LOG_TG_EVENTS 1
+#endif
+#ifndef LOG_TG_DEBUG
+  #define LOG_TG_DEBUG 1
+#endif
+
+// Callbacks
+static tg_local_symbol_cb_t cb_local_symbol = nullptr;
+static tg_local_down_cb_t cb_local_down = nullptr;
+static tg_local_up_cb_t cb_local_up = nullptr;
+static tg_mode_toggle_cb_t cb_mode_toggle = nullptr;
+
+static tg_remote_symbol_cb_t cb_remote_symbol = nullptr;
+static tg_remote_down_cb_t cb_remote_down = nullptr;
+static tg_remote_up_cb_t cb_remote_up = nullptr;
+
+// Key event queue (ISR -> telegrapher)
+#define TG_KEY_Q_SZ 32
+static volatile TG_KeyEvent keyQ[TG_KEY_Q_SZ];
+static volatile uint8_t keyQ_head = 0;
+static volatile uint8_t keyQ_tail = 0;
+static volatile uint8_t keyQ_count = 0;
+
+// internal state for local press handling
+static bool localPressed = false;
+static unsigned long localPress_us = 0;
+static unsigned long lastLocalRelease_ms = 0;
+static char symbolBuffer[32];
+static uint8_t symbolIndex = 0;
+
+// hold detection state
+static bool modeHoldReported = false;
+static bool inHoldMode = false;
+static unsigned long holdStart_ms = 0;
+
+// remote pressed state
+static bool remotePressed = false;
+static unsigned long remotePressStart_ms = 0;
+
+// helper logging
+static void tlog(bool flag, const char* fmt, ...) {
+  if (!flag) return;
+  va_list ap; va_start(ap, fmt);
+  vprintf(fmt, ap);
+  va_end(ap);
+  Serial.println();
+}
+
+// ISR-safe enqueue (morse-key should call this). Copies fields explicitly.
+bool telegrapher_pushKeyEvent(const TG_KeyEvent* ev) {
+  if (!ev) return false;
+  uint8_t next = (uint8_t)((keyQ_tail + 1) % TG_KEY_Q_SZ);
+
+  // If full, drop oldest
+  noInterrupts();
+  if (keyQ_count >= TG_KEY_Q_SZ) {
+    keyQ_head = (uint8_t)((keyQ_head + 1) % TG_KEY_Q_SZ);
+    keyQ_count--;
+  }
+
+  // copy fields explicitly to volatile slot
+  keyQ[keyQ_tail].down = ev->down;
+  keyQ[keyQ_tail].t_us = ev->t_us;
+  keyQ_tail = next;
+  keyQ_count++;
+  interrupts();
+  return true;
+}
+
+// dequeue helper (non-ISR context) - copy fields explicitly
+static bool keyq_dequeue(TG_KeyEvent* out) {
+  if (!out) return false;
+  // quick check without disabling interrupts
+  if (keyQ_count == 0) return false;
+
+  noInterrupts();
+  if (keyQ_count == 0) { interrupts(); return false; }
+
+  // explicit field copy from volatile array to non-volatile out
+  out->down = keyQ[keyQ_head].down;
+  out->t_us = keyQ[keyQ_head].t_us;
+
+  keyQ_head = (uint8_t)((keyQ_head + 1) % TG_KEY_Q_SZ);
+  keyQ_count--;
+  interrupts();
+  return true;
+}
+
+// Public lifecycle
+void telegrapher_init() {
+  noInterrupts();
+  keyQ_head = keyQ_tail = keyQ_count = 0;
+  interrupts();
+
+  localPressed = false;
+  symbolIndex = 0;
+  symbolBuffer[0] = '\0';
+  modeHoldReported = false;
+  inHoldMode = false;
+  holdStart_ms = 0;
+  remotePressed = false;
+  cb_local_symbol = nullptr;
+  cb_local_down = nullptr;
+  cb_local_up = nullptr;
+  cb_mode_toggle = nullptr;
+  cb_remote_symbol = nullptr;
+  cb_remote_down = nullptr;
+  cb_remote_up = nullptr;
+  tlog(LOG_TG_EVENTS, "%lu - telegrapher initialized", millis());
+}
+
+void telegrapher_onLocalSymbol(tg_local_symbol_cb_t cb) { cb_local_symbol = cb; }
+void telegrapher_onLocalDown(tg_local_down_cb_t cb) { cb_local_down = cb; }
+void telegrapher_onLocalUp(tg_local_up_cb_t cb) { cb_local_up = cb; }
+void telegrapher_onModeToggle(tg_mode_toggle_cb_t cb) { cb_mode_toggle = cb; }
+
+void telegrapher_onRemoteSymbol(tg_remote_symbol_cb_t cb) { cb_remote_symbol = cb; }
+void telegrapher_onRemoteDown(tg_remote_down_cb_t cb) { cb_remote_down = cb; }
+void telegrapher_onRemoteUp(tg_remote_up_cb_t cb) { cb_remote_up = cb; }
+
+bool telegrapher_isInHoldMode() { return inHoldMode; }
+
+// Handle remote events called by morse-telecom callbacks
+void telegrapher_handleRemoteDown() {
+  unsigned long now = millis();
+  if (remotePressed) return;
+  remotePressed = true;
+  remotePressStart_ms = now;
+  tlog(LOG_TG_EVENTS, "%lu - telegrapher: remote down", now);
+  ns_notifyRemoteDown();
+  if (cb_remote_down) cb_remote_down();
+}
+
+void telegrapher_handleRemoteUp() {
+  unsigned long now = millis();
+  if (!remotePressed) return;
+  unsigned long dur = now - remotePressStart_ms;
+  remotePressed = false;
+  tlog(LOG_TG_EVENTS, "%lu - telegrapher: remote up dur=%lu", now, dur);
+  ns_notifyRemoteUp();
+  if (cb_remote_up) cb_remote_up();
+}
+
+void telegrapher_handleRemoteSymbol(char sym, unsigned long dur_ms) {
+  tlog(LOG_TG_EVENTS, "%lu - telegrapher: remote symbol %c dur=%lu", millis(), sym, dur_ms);
+  ns_notifyRemoteSymbol(sym, dur_ms);
+  if (cb_remote_symbol) cb_remote_symbol(sym, dur_ms);
+}
+
+// Internal helper: finalize buffered local morse sequence into a letter (if needed)
+static void finalizeLocalBuffer() {
+  if (symbolIndex == 0) return;
+  tlog(LOG_TG_DEBUG, "%lu - telegrapher: finalize buffer \"%s\"", millis(), symbolBuffer);
+  // TODO: translate symbolBuffer -> letter via translator and push to history if needed
+  // reset buffer
+  symbolIndex = 0;
+  symbolBuffer[0] = '\0';
+}
+
+// classify duration (ms) to symbol or ignore
+static bool classify_duration_to_symbol(unsigned long dur_ms, char* outSym) {
+  if (!outSym) return false;
+  if (dur_ms <= DOT_MAX) {
+    *outSym = '.';
+    return true;
+  } else if (dur_ms <= DASH_MAX) {
+    *outSym = '-';
+    return true;
+  }
+  return false;
+}
+
+// Process a local complete press-release (dur_ms in ms)
+static void processLocalPressDuration(unsigned long dur_ms) {
+  // Long press handling
+  if (dur_ms >= LONG_PRESS_MS) {
+    tlog(LOG_TG_EVENTS, "%lu - telegrapher: local very long press dur=%lu -> finalize", millis(), dur_ms);
+    finalizeLocalBuffer();
+    return;
+  }
+
+  if (dur_ms > DASH_MAX) {
+    tlog(LOG_TG_DEBUG, "%lu - telegrapher: local press too long for dot/dash dur=%lu ignored", millis(), dur_ms);
+    return;
+  }
+
+  char sym;
+  if (!classify_duration_to_symbol(dur_ms, &sym)) {
+    tlog(LOG_TG_DEBUG, "%lu - telegrapher: classify failed dur=%lu", millis(), dur_ms);
+    return;
+  }
+
+  if (symbolIndex < (sizeof(symbolBuffer) - 1)) {
+    symbolBuffer[symbolIndex++] = sym;
+    symbolBuffer[symbolIndex] = '\0';
+  }
+
+  if (cb_local_symbol) cb_local_symbol(sym, dur_ms);
+  ns_requestLocalSymbol(sym, dur_ms);
+  tlog(LOG_TG_EVENTS, "%lu - telegrapher: local symbol %c dur=%lu emitted", millis(), sym, dur_ms);
+}
+
+// Main update: drain key queue and manage hold detection/gap finalization
+void telegrapher_update() {
+  unsigned long now_ms = millis();
+
+  // 1) process all queued key events
+  TG_KeyEvent ev;
+  while (keyq_dequeue(&ev)) {
+    if (ev.down) {
+      // Key down edge
+      if (localPressed) {
+        tlog(LOG_TG_DEBUG, "%lu - telegrapher: duplicate local down ignored", now_ms);
+      } else {
+        localPressed = true;
+        localPress_us = ev.t_us;
+        holdStart_ms = now_ms;
+        modeHoldReported = false;
+        tlog(LOG_TG_EVENTS, "%lu - telegrapher: local down (us=%lu)", now_ms, ev.t_us);
+        ns_requestLocalDown();
+        if (cb_local_down) cb_local_down();
+      }
+    } else {
+      // Key up edge
+      if (!localPressed) {
+        tlog(LOG_TG_DEBUG, "%lu - telegrapher: stray local up ignored", now_ms);
+      } else {
+        localPressed = false;
+        unsigned long dur_ms = 0;
+        if (ev.t_us >= localPress_us) {
+          // convert microseconds delta to rounded milliseconds
+          dur_ms = (ev.t_us - localPress_us + 500) / 1000;
+        }
+        lastLocalRelease_ms = now_ms;
+        tlog(LOG_TG_EVENTS, "%lu - telegrapher: local up dur_ms=%lu", now_ms, dur_ms);
+        ns_requestLocalUp();
+        if (cb_local_up) cb_local_up();
+        processLocalPressDuration(dur_ms);
+      }
+    }
+  }
+
+  // 2) hold / mode toggle detection while key is still pressed
+  if (localPressed && !modeHoldReported) {
+    if ((now_ms - holdStart_ms) >= MODE_HOLD_MS) {
+      modeHoldReported = true;
+      inHoldMode = !inHoldMode;
+      tlog(LOG_TG_EVENTS, "%lu - telegrapher: MODE TOGGLE, inHoldMode=%d", now_ms, (int)inHoldMode);
+      if (cb_mode_toggle) cb_mode_toggle();
+    }
+  }
+
+  // 3) letter gap detection: if there are buffered symbols and enough silence since last local release, finalize
+  if (symbolIndex > 0) {
+    if ((now_ms - lastLocalRelease_ms) >= LETTER_GAP_MS) {
+      tlog(LOG_TG_EVENTS, "%lu - telegrapher: letter gap reached -> finalize", now_ms);
+      finalizeLocalBuffer();
+    }
+  }
+
+  // 4) remotePressed handled elsewhere via callbacks
+}
+
+----- FILE: src\telegrapher.h -----
+// File: telegrapher.h v1.0
+// Description: Non-blocking telegrapher â€” key queue, classification, mode toggle, callbacks
+// Last modification: IRQ-safe queue, explicit field copies, gap finalization hooks
+// Modified: 2025-11-15 03:32
+// Created: 2025-11-15
+
+#ifndef TELEGRAPHER_H
+#define TELEGRAPHER_H
+
+#include <Arduino.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+// Key event produced by morse-key (ISR-safe minimal)
+typedef struct {
+  bool down;            // true = key down, false = key up
+  unsigned long t_us;   // timestamp in microseconds (from micros())
+} TG_KeyEvent;
+
+// Callback types used by telegrapher
+typedef void (*tg_local_symbol_cb_t)(char sym, unsigned long dur_ms); // local symbol produced ('.' or '-')
+typedef void (*tg_local_down_cb_t)(void);    // local key down
+typedef void (*tg_local_up_cb_t)(void);      // local key up
+typedef void (*tg_mode_toggle_cb_t)(void);   // long-hold toggled mode
+
+typedef void (*tg_remote_symbol_cb_t)(char sym, unsigned long dur_ms); // remote symbol arrived
+typedef void (*tg_remote_down_cb_t)(void);  // remote down started
+typedef void (*tg_remote_up_cb_t)(void);    // remote up ended
+
+// Lifecycle
+void telegrapher_init();
+void telegrapher_update();
+
+// ISR -> telegrapher enqueue (called from morse-key ISR or deferred handler).
+// Returns true when enqueued. telegrapher_update() will dequeue and process.
+bool telegrapher_pushKeyEvent(const TG_KeyEvent* ev);
+
+// Callbacks registration
+void telegrapher_onLocalSymbol(tg_local_symbol_cb_t cb);
+void telegrapher_onLocalDown(tg_local_down_cb_t cb);
+void telegrapher_onLocalUp(tg_local_up_cb_t cb);
+void telegrapher_onModeToggle(tg_mode_toggle_cb_t cb);
+
+void telegrapher_onRemoteSymbol(tg_remote_symbol_cb_t cb);
+void telegrapher_onRemoteDown(tg_remote_down_cb_t cb);
+void telegrapher_onRemoteUp(tg_remote_up_cb_t cb);
+
+// Remote event handlers (to be called by morse-telecom when remote events decoded)
+void telegrapher_handleRemoteDown();
+void telegrapher_handleRemoteUp();
+void telegrapher_handleRemoteSymbol(char sym, unsigned long dur_ms);
+
+// Query
+bool telegrapher_isInHoldMode();
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif // TELEGRAPHER_H
+
+----- FILE: src\translator.cpp -----
+// File: translator.cpp v1.0
+// Description: Stateless Morse <-> ASCII translator with compact lookup tables
+// Last modification: word-to-ASCII helper and buffer safety guards
+// Modified: 2025-11-15 03:36
+// Created: 2025-11-15
+
+#include "translator.h"
+#include <string.h>
+#include <ctype.h>
+
+// Static mapping table: ASCII -> Morse
+// Only uppercase letters, digits and a few punctuation supported
+struct Mapping { char ch; const char* morse; };
+
+static const Mapping mappingTable[] = {
+  { 'A', ".-"   }, { 'B', "-..." }, { 'C', "-.-." }, { 'D', "-.."  }, { 'E', "."    },
+  { 'F', "..-." }, { 'G', "--."  }, { 'H', "...." }, { 'I', ".."   }, { 'J', ".---" },
+  { 'K', "-.-"  }, { 'L', ".-.." }, { 'M', "--"   }, { 'N', "-."   }, { 'O', "---"  },
+  { 'P', ".--." }, { 'Q', "--.-" }, { 'R', ".-."  }, { 'S', "..."  }, { 'T', "-"    },
+  { 'U', "..-"  }, { 'V', "...-" }, { 'W', ".--"  }, { 'X', "-..-" }, { 'Y', "-.--" },
+  { 'Z', "--.." },
+
+  { '0', "-----" }, { '1', ".----" }, { '2', "..---" }, { '3', "...--" }, { '4', "....-" },
+  { '5', "....." }, { '6', "-...." }, { '7', "--..." }, { '8', "---.." }, { '9', "----." },
+
+  // common punctuation (small set)
+  { '.', ".-.-.-" }, { ',', "--..--" }, { '?', "..--.." }, { '\'', ".----." },
+  { '!', "-.-.--" }, { '/', "-..-." }, { '(', "-.--." }, { ')', "-.--.-" },
+  { '&', ".-..." }, { ':', "---..." }, { ';', "-.-.-." }, { '=', "-...-" },
+  { '+', ".-.-." }, { '-', "-....-" }, { '_', "..--.-" }, { '"', ".-..-." },
+  { '$', "...-..-" }, { '@', ".--.-." }
+};
+
+static const size_t MAPPING_COUNT = sizeof(mappingTable) / sizeof(mappingTable[0]);
+
+void translator_init() {
+  // no-op for now; function kept for symmetry and future extension
+}
+
+// Helper: lookup morse by char. Returns pointer or nullptr
+static const char* lookupMorseByChar(char c) {
+  for (size_t i = 0; i < MAPPING_COUNT; ++i) {
+    if (mappingTable[i].ch == c) return mappingTable[i].morse;
+  }
+  return nullptr;
+}
+
+// Helper: lookup char by morse string. Returns '\0' if not found
+static char lookupCharByMorse(const char* morse) {
+  if (!morse || !*morse) return '\0';
+  for (size_t i = 0; i < MAPPING_COUNT; ++i) {
+    if (strcmp(mappingTable[i].morse, morse) == 0) return mappingTable[i].ch;
+  }
+  return '\0';
+}
+
+char translator_morseToChar(const char* morse) {
+  if (!morse) return '\0';
+  return lookupCharByMorse(morse);
+}
+
+bool translator_charToMorse(char letter, char* outBuf, size_t bufLen) {
+  if (!outBuf || bufLen == 0) return false;
+  char up = (char)toupper((unsigned char)letter);
+  const char* m = lookupMorseByChar(up);
+  if (!m) return false;
+  size_t need = strlen(m) + 1;
+  if (bufLen < need) return false;
+  strncpy(outBuf, m, bufLen);
+  outBuf[bufLen - 1] = '\0';
+  return true;
+}
+
+size_t translator_morseWordToAscii(const char* morseWord, char* outBuf, size_t bufLen) {
+  if (!morseWord || !outBuf || bufLen == 0) return 0;
+  size_t written = 0;
+  const char* p = morseWord;
+  char token[16];
+  while (*p) {
+    // skip leading spaces
+    while (*p == ' ') p++;
+    if (!*p) break;
+    // copy token up to space
+    size_t ti = 0;
+    while (*p && *p != ' ' && ti < sizeof(token) - 1) {
+      token[ti++] = *p++;
+    }
+    token[ti] = '\0';
+    // if token longer than token buffer, skip to next space
+    if (ti == sizeof(token) - 1 && *p && *p != ' ') {
+      // skip rest of this token
+      while (*p && *p != ' ') p++;
+    }
+    // translate token
+    char ch = lookupCharByMorse(token);
+    if (ch == '\0') ch = '?';
+    if (written + 1 < bufLen) {
+      outBuf[written++] = ch;
+    } else {
+      break; // no more room (reserve one for null)
+    }
+  }
+  if (written < bufLen) outBuf[written] = '\0';
+  else outBuf[bufLen - 1] = '\0';
+  return written;
+}
+
+----- FILE: src\translator.h -----
+// File: translator.h v1.0
+// Description: Stateless Morse translator (Morse <-> ASCII) with compact lookup table
+// Last modification: added word-to-ASCII helper and buffer-safety guards
+// Modified: 2025-11-15 03:32
+// Created: 2025-11-15
+
+#ifndef TRANSLATOR_H
+#define TRANSLATOR_H
+
+#include <Arduino.h>
+
+// Initialize translator (no-op but provided for symmetry)
+void translator_init();
+
+// Translate a morse sequence (null-terminated, e.g. ".-") to an ASCII uppercase character.
+// Returns '\0' if unknown.
+char translator_morseToChar(const char* morse);
+
+// Translate an ASCII character to a morse sequence.
+// - letter: input char (case-insensitive for letters)
+// - outBuf: buffer to receive null-terminated morse string (e.g., ".-")
+// - bufLen: length of outBuf
+// Returns true if a mapping was written to outBuf, false if unknown or bufLen too small.
+bool translator_charToMorse(char letter, char* outBuf, size_t bufLen);
+
+// Convenience: translate a full morse word (symbols separated by space) into a C-string of letters.
+// - morseWord: e.g. "... --- ..." or ".- -..."
+// - outBuf: target buffer for ASCII (no separators); bufLen: capacity
+// Returns number of characters written (0 if none or error). Unknown sequences are written as '?'.
+size_t translator_morseWordToAscii(const char* morseWord, char* outBuf, size_t bufLen);
+
+#endif
+

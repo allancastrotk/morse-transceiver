@@ -1,3 +1,9 @@
+// File: bitmap.h v1.0
+// Description: Morse transceiver module — Splash screen bitmap stored in PROGMEM (128x64)
+// Last modification: included placeholder; no change to bit pattern
+// Modified: 2025-11-14 22:09
+// Created: 2025-11-14
+
 #ifndef BITMAP_H
 #define BITMAP_H
 

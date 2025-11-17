@@ -1,12 +1,11 @@
-// File:        main.cpp v1.1
+// File:        main.cpp v1.5
 // Project:     Morse Transceiver
 // Description: Main integration entry for Morse Transceiver. Wires modules: morse-key, telegrapher,
 //              morse-telecom, network-state, history, display-adapter, buzzer-driver, translator,
 //              network-connect, blinker. Non-blocking cooperative loop.
-// Last modification: mode-aware history/display wiring; showSymbol in MORSE; ignore unknown letter;
-//                    clean symbol buffer handling to avoid first-letter erratic behavior
-// Modified:    2025-11-18
-// Created:     2025-11-15
+// Last modification: TX immediate display/history, conditional network send, blinker set to LED_BUILTIN.
+// Modified:    2025-11-16
+// Created:     2025-11-15%
 //
 // License:     MIT License
 
@@ -35,35 +34,28 @@
 #define BUZZER_PIN 12
 
 // -----------------------------------------------------------------------------
-// Module enable flags (1 = enabled, 0 = disabled)
+// Module enable flags
 // -----------------------------------------------------------------------------
 #define ENABLE_TRANSLATOR     1
 #define ENABLE_DISPLAY        1
 #define ENABLE_BUTTON         1
 #define ENABLE_BUZZER         0
-#define ENABLE_BLINKER        0
-
-// Infrastructure / helper modules
+#define ENABLE_BLINKER        1
 #define ENABLE_HISTORY        1
-
-// Morse-telecom paths
-#define ENABLE_MORSE_TELECOM  0
+#define ENABLE_MORSE_TELECOM  1
 #define ENABLE_ENCODER        0
 #define ENABLE_DECODER        0
-
-// Network features
-#define ENABLE_NETWORK_CONN   0
-#define ENABLE_NETWORK_TX     0
-#define ENABLE_NETWORK_RX     0
-#define ENABLE_NETWORK_STATE  0
+#define ENABLE_NETWORK_CONN   1
+#define ENABLE_NETWORK_TX     1
+#define ENABLE_NETWORK_RX     1
+#define ENABLE_NETWORK_STATE  1
 
 // -----------------------------------------------------------------------------
-// Symbol accumulation for translator (per-letter buffer, spaced symbols)
+// Symbol accumulation for translator
 // -----------------------------------------------------------------------------
 static char symBuf[64];
 static size_t symPos = 0;
 
-// Push one symbol and a space (". " or "- ")
 static void pushSymToBuf(char sym) {
   if (!(sym == '.' || sym == '-')) return;
   if (symPos + 2 < sizeof(symBuf)) {
@@ -73,7 +65,6 @@ static void pushSymToBuf(char sym) {
   }
 }
 
-// Clear buffer to clean start (avoid first-letter garbage)
 static void clearSymBuf(void) {
   symPos = 0;
   symBuf[0] = '\0';
@@ -83,38 +74,27 @@ static void clearSymBuf(void) {
 // Adapter / wiring callbacks
 // -----------------------------------------------------------------------------
 static void onTelegrapherLocalSymbol(char sym, unsigned long dur_ms) {
-  // Always accumulate locally for finalize
   pushSymToBuf(sym);
 
-  // Mode-aware history + display
 #if ENABLE_TRANSLATOR
   if (!translator_isDidatic()) {
-    // MORSE mode: history records only symbols; display shows symbol 1.5s
 #if ENABLE_HISTORY
-    history_pushTXSymbol(sym);
+    history_pushTXSymbol(sym);   // ✅ TX imediato
 #endif
 #if ENABLE_DISPLAY
     displayAdapter_showSymbol(sym);
     displayAdapter_forceRedraw();
 #endif
-  } else {
-    // DIDATIC mode: não registra símbolos no history; aguarda finalize para letra
-#if ENABLE_DISPLAY
-    // opcional: pode mostrar o símbolo momentâneo também, mas documentação prioriza letra no finalize
-#endif
   }
-#else
-  // Sem translator: apenas registra símbolo no history
-#if ENABLE_HISTORY
-  history_pushTXSymbol(sym);
-#endif
 #endif
 
 #if ENABLE_NETWORK_STATE
   ns_requestLocalSymbol(sym, dur_ms);
 #endif
 #if ENABLE_NETWORK_TX && ENABLE_MORSE_TELECOM
-  morse_telecom_sendSymbol(sym, dur_ms);
+  if (nc_isConnected()) {
+    morse_telecom_sendSymbol(sym, dur_ms);
+  }
 #endif
 #if ENABLE_BUZZER
   buzzer_driver_playClick();
@@ -122,13 +102,13 @@ static void onTelegrapherLocalSymbol(char sym, unsigned long dur_ms) {
 }
 
 static void onTelegrapherLocalDown() {
-  
-
 #if ENABLE_NETWORK_STATE
   ns_requestLocalDown();
 #endif
 #if ENABLE_NETWORK_TX && ENABLE_MORSE_TELECOM
-  morse_telecom_sendDown();
+  if (nc_isConnected()) {
+    morse_telecom_sendDown();
+  }
 #endif
 #if ENABLE_BUZZER
   buzzer_driver_playClick();
@@ -143,17 +123,18 @@ static void onTelegrapherLocalUp() {
   ns_requestLocalUp();
 #endif
 #if ENABLE_NETWORK_TX && ENABLE_MORSE_TELECOM
-  morse_telecom_sendUp();
+  if (nc_isConnected()) {
+    morse_telecom_sendUp();
+  }
 #endif
 #if ENABLE_BUZZER
   buzzer_driver_playClick();
 #endif
 }
 
-// Finalize callback: traduz a letra e exibe conforme modo
+// Finalize callback
 static void onTelegrapherFinalize() {
   if (symPos == 0) return;
-  // Remover o espaço final
   if (symPos > 0) symBuf[symPos - 1] = '\0';
 
 #if ENABLE_TRANSLATOR
@@ -164,55 +145,43 @@ static void onTelegrapherFinalize() {
 #if LOG_MAIN_ACTION
     Serial.printf("%lu - main - [ACTION] letter -> \"%s\" (morse \"%s\")\n", millis(), ascii, symBuf);
 #endif
-    if (translator_isDidatic()) {
-      // DIDATIC: history só com letras, display mostra letra por 1,5s
 #if ENABLE_HISTORY
-      history_pushTXLetter(ascii[0]);
+    history_pushTXLetter(ascii[0]);
 #endif
 #if ENABLE_DISPLAY
-      displayAdapter_showLetter(ascii);
-      displayAdapter_forceRedraw();
+    displayAdapter_showLetter(ascii);
+    displayAdapter_forceRedraw();
 #endif
-    } else {
-      // MORSE: não registrar letra no history (apenas símbolos). Opcional: pode mostrar letra também.
-#if ENABLE_DISPLAY
-      // Se quiser ver a letra traduzida mesmo em MORSE, descomente:
-      // displayAdapter_showLetter(ascii);
-      // displayAdapter_forceRedraw();
-#endif
-    }
-  } else {
-#if LOG_MAIN_ACTION
-    Serial.printf("%lu - main - [ACTION] invalid sequence (morse \"%s\")\n", millis(), symBuf);
-#endif
-    // Não empurrar '?' para o history; opcional: efeito visual
-    // displayAdapter_forceRedraw(); // se houver efeito de erro
   }
-#else
-#if LOG_MAIN_ACTION
-  Serial.printf("%lu - main - [ACTION] morse \"%s\"\n", millis(), symBuf);
-#endif
 #endif
 
   clearSymBuf();
 }
 
-// Long-press callback: alterna modo
+// Long-press callback: alterna modo + overlay
 static void onTelegrapherLongPress() {
 #if ENABLE_TRANSLATOR
-  if (translator_isDidatic()) translator_setModeMorse();
+  bool toMorse = translator_isDidatic();
+  if (toMorse) translator_setModeMorse();
   else translator_setModeDidatic();
+
 #if LOG_MAIN_ACTION
   Serial.printf("%lu - main - [ACTION] translator mode toggled -> %s\n",
                 millis(), translator_isDidatic() ? "DIDATIC" : "MORSE");
 #endif
-#endif
+
 #if ENABLE_DISPLAY
+  if (translator_isDidatic()) {
+    displayAdapter_showModeMessage("DIDATIC", "MODE");
+  } else {
+    displayAdapter_showModeMessage("MORSE", "MODE");
+  }
   displayAdapter_forceRedraw();
+#endif
 #endif
 }
 
-// Remote telegrapher -> local effects
+// Remote telegrapher -> RX only
 static void onTelegrapherRemoteSymbol(char sym, unsigned long dur_ms) {
 #if ENABLE_HISTORY
   history_pushRXSymbol(sym);
@@ -273,16 +242,7 @@ void setup() {
   history_init();
 #endif
 #if ENABLE_TRANSLATOR
-  translator_init(); // default DIDATIC
-#endif
-#if (ENABLE_ENCODER || ENABLE_DECODER) && ENABLE_MORSE_TELECOM
-  morse_telecom_init();
-#endif
-#if ENABLE_NETWORK_CONN
-  initNetworkConnect();
-#endif
-#if ENABLE_NETWORK_STATE
-  initNetworkState();
+  translator_init();
 #endif
 
   telegrapher_init();
@@ -307,51 +267,33 @@ void setup() {
   telegrapher_onRemoteDown(onTelegrapherRemoteDown);
   telegrapher_onRemoteUp(onTelegrapherRemoteUp);
 
-#if (ENABLE_NETWORK_RX || ENABLE_NETWORK_CONN) && ENABLE_MORSE_TELECOM
-  morse_telecom_onRemoteDown(mt_remoteDown_cb);
-  morse_telecom_onRemoteUp(mt_remoteUp_cb);
-  morse_telecom_onRemoteSymbol(mt_remoteSymbol_cb);
-#endif
-#if ENABLE_NETWORK_STATE
-  ns_onStateChange(onNsStateChange);
-#endif
 #if ENABLE_DISPLAY
   displayAdapter_showSplash("Morse", "Booting...", 3000);
   displayAdapter_forceRedraw();
 #endif
 
-#if ENABLE_BLINKER
-  initBlinker(255, "SEMPRE ALERTA");
-#endif
-
   clearSymBuf();
+
+#if ENABLE_BLINKER
+  // ✅ Blinker agora usa LED principal (GPIO2)
+  initBlinker(LED_BUILTIN, "SEMPRE ALERTA");
+#endif
 }
 
 // -----------------------------------------------------------------------------
-// Cooperative main loop (non-blocking)
+// Cooperative main loop
 // -----------------------------------------------------------------------------
 void loop() {
-  // Network...
-#if (ENABLE_NETWORK_CONN || ENABLE_NETWORK_TX || ENABLE_NETWORK_RX || ENABLE_NETWORK_STATE)
-  updateNetworkConnect();
-  morse_telecom_update();
-  updateNetworkState();
-#endif
-
-  // Process input queue first (drain ISR queue)
 #if ENABLE_BUTTON
   morse_key_process();
 #endif
 
-  // Then classify and dispatch
   telegrapher_update();
+  updateNetworkState();
+  displayAdapter_update();
 
 #if ENABLE_DISPLAY
   displayAdapter_update();
-#endif
-
-#if ENABLE_BUZZER
-  buzzer_driver_update();
 #endif
 
 #if ENABLE_BLINKER

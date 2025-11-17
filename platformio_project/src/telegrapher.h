@@ -1,7 +1,9 @@
-// File: telegrapher.h v1.3
+// File: telegrapher.h v1.4
 // Description: Telegrapher module API (non-blocking, ISR-safe key event capture).
-// Last modification: align header format with project standard; API unchanged
-// Modified: 2025-11-16
+//              Handles classification of key press durations into dot/dash,
+//              letter finalization, and long-press detection.
+// Last modification: aligned with project standard; added finalize and long-press callbacks.
+// Modified: 2025-11-18
 // Created: 2025-11-15
 
 #ifndef TELEGRAPHER_H
@@ -35,7 +37,7 @@ void telegrapher_onLocalSymbol(tg_local_symbol_cb_t cb);
 void telegrapher_onLocalDown(tg_simple_cb_t cb);
 void telegrapher_onLocalUp(tg_simple_cb_t cb);
 
-// NEW: finalize (letter gap reached) and long-press callbacks
+// Finalize (letter gap reached) and long-press callbacks
 void telegrapher_onFinalize(tg_simple_cb_t cb);
 void telegrapher_onLongPress(tg_simple_cb_t cb);
 

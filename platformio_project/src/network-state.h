@@ -1,73 +1,45 @@
-// File: network-state.h v1.0
-// Description: Link state manager (TX/RX/FREE) with local/remote events and callbacks
-// Last modification: added timing constants and query helpers
-// Modified: 2025-11-15 03:32
+// File: network-state.h v1.2
+// Description: Header for network-state.cpp, defines ConnectionState enum and callback types.
+// Last modification: added CONTENTION state for conflict resolution
+// Modified: 2025-11-18
 // Created: 2025-11-15
 
 #ifndef NETWORK_STATE_H
 #define NETWORK_STATE_H
 
-#include <Arduino.h>
-
-// Shared connection state used across modules (moved here to remove dependency on cw-transceiver.h)
+// Enum de estados de conexão
 typedef enum {
-  FREE = 0,
-  TX   = 1,
-  RX   = 2
+    FREE = 0,       // idle/offline
+    TX   = 1,       // transmitindo local
+    RX   = 2,       // recebendo remoto
+    CONTENTION = 3  // conflito detectado (local e remoto pressionados juntos)
 } ConnectionState;
 
-// Optional timing constants that some modules expect (override before include if needed)
-#ifndef DOT_MAX
-  #define DOT_MAX        160
-#endif
-#ifndef DASH_MAX
-  #define DASH_MAX       480
-#endif
-#ifndef MODE_HOLD_MS
-  #define MODE_HOLD_MS   1500
-#endif
-#ifndef LONG_PRESS_MS
-  #define LONG_PRESS_MS  2000
-#endif
-#ifndef LETTER_GAP_MS
-  #define LETTER_GAP_MS  360
-#endif
+// Callback types
+typedef void (*ns_state_cb_t)(ConnectionState s);
+typedef void (*ns_local_send_cb_t)(void);
+typedef void (*ns_local_symbol_cb_t)(char sym, unsigned long dur_ms);
+typedef void (*ns_remote_symbol_cb_t)(char sym, unsigned long dur_ms);
 
-#ifdef __cplusplus
-extern "C" {
-#endif
-
-typedef void (*ns_state_cb_t)(ConnectionState newState);
-typedef void (*ns_local_send_cb_t)(void);                // request to send DOWN (start) or UP (stop)
-typedef void (*ns_local_symbol_cb_t)(char sym, unsigned long dur_ms); // when local generates a symbol
-typedef void (*ns_remote_symbol_cb_t)(char sym, unsigned long dur_ms); // remote symbol arrived
-
+// Public API
 void initNetworkState();
-void updateNetworkState();
+ConnectionState ns_getState();
+unsigned long ns_lastActivityMs();
 
-// Called by CW layer when user presses/releases
-void ns_requestLocalDown();         // local key pressed (start TX)
-void ns_requestLocalUp();           // local key released (stop TX)
-void ns_requestLocalSymbol(char sym, unsigned long dur_ms); // local symbol produced (dot/dash)
-
-// Called by telecom/connect module when remote events arrive
-void ns_notifyRemoteDown();         // remote pressed (RX starts)
-void ns_notifyRemoteUp();           // remote released (RX ends)
-void ns_notifyRemoteSymbol(char sym, unsigned long dur_ms); // remote symbol (decoded by telecom)
-
-// Callbacks registration
 void ns_onStateChange(ns_state_cb_t cb);
 void ns_onLocalSendDown(ns_local_send_cb_t cb);
 void ns_onLocalSendUp(ns_local_send_cb_t cb);
 void ns_onLocalSymbol(ns_local_symbol_cb_t cb);
 void ns_onRemoteSymbol(ns_remote_symbol_cb_t cb);
 
-// Query
-ConnectionState ns_getState();
-unsigned long ns_lastActivityMs();
+void ns_requestLocalDown();
+void ns_requestLocalUp();
+void ns_requestLocalSymbol(char sym, unsigned long dur_ms);
 
-#ifdef __cplusplus
-}
-#endif
+void ns_notifyRemoteDown();
+void ns_notifyRemoteUp();
+void ns_notifyRemoteSymbol(char sym, unsigned long dur_ms);
+
+void updateNetworkState();
 
 #endif // NETWORK_STATE_H

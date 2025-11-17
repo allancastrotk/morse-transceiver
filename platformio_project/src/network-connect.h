@@ -1,7 +1,7 @@
-// File: network-connect.h v1.0
-// Description: Non-blocking WiFi + TCP connector with outgoing queue and callbacks
-// Last modification: role reporting (AP/CLIENT/PEER) and heartbeat support
-// Modified: 2025-11-15 03:32
+// File: network-connect.h v1.2
+// Description: Public API for non-blocking WiFi + TCP connector (ESP8266).
+// Last modification: unified log flags, added nc_isConnected() accessor.
+// Modified: 2025-11-16
 // Created: 2025-11-15
 
 #ifndef NETWORK_CONNECT_H
@@ -9,24 +9,38 @@
 
 #include <Arduino.h>
 
-typedef enum { NC_SCANNING, NC_CONNECTING, NC_CONNECTED, NC_AP_MODE, NC_DISCONNECTED } NC_State;
+// Connection states
+enum NC_State {
+  NC_SCANNING,
+  NC_CONNECTING,
+  NC_CONNECTED,
+  NC_AP_MODE,
+  NC_DISCONNECTED
+};
 
+// Callback types
 typedef void (*nc_cb_t)(void);
 typedef void (*nc_cb_ip_t)(const char* ip);
 
+// ====== Public API ======
 void initNetworkConnect();
 void updateNetworkConnect();
 
+// Outgoing queue
+void nc_enqueueOutgoing(const char* line);
+
+// Connection status
 bool nc_isConnected();
 bool nc_isActingClient();
 const char* nc_getPeerIP();
 const char* nc_getRole();
 
-void nc_enqueueOutgoing(const char* line); // queue a line to send when possible
+// Signal strength (bars or "OFF")
+const char* getNetworkStrength();
 
-// Callbacks (only one subscriber for each; modules can chain if needed)
-void nc_onConnected(nc_cb_t cb);       // called when link considered ready (after handshake)
-void nc_onDisconnected(nc_cb_t cb);    // called when link lost
-void nc_onAcceptedClient(nc_cb_ip_t cb); // called when server accepted a client (IP provided)
+// Callbacks
+void nc_onConnected(nc_cb_t cb);
+void nc_onDisconnected(nc_cb_t cb);
+void nc_onAcceptedClient(nc_cb_ip_t cb);
 
-#endif
+#endif // NETWORK_CONNECT_H
